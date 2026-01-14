@@ -60,11 +60,6 @@ def collect_files(root):
                 files.append(p)
     return files
 
-def normalize_mega_url(url: str) -> str:
-    if "/folder/" in url:
-        return url.split("/folder/")[0]
-    return url
-
 # ---------- PIXELDRAIN ----------
 def download_pixeldrain(fid, path):
     r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
@@ -74,19 +69,44 @@ def download_pixeldrain(fid, path):
             if c:
                 f.write(c)
 
-# ---------- MEGA ----------
+# ---------- MEGA (mega-cmd primary, megatools fallback) ----------
 def download_mega(url):
-    url = normalize_mega_url(url)
+    if not ("mega.nz/file/" in url or "mega.nz/folder/" in url):
+        raise Exception("Invalid MEGA link (send file or folder link)")
+
+    # ---- PRIMARY: mega-cmd ----
+    try:
+        subprocess.run(
+            ["mega-cmd-server"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False
+        )
+
+        subprocess.run(
+            ["mega-login"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False
+        )
+
+        subprocess.run(
+            ["mega-get", url, DOWNLOAD_DIR],
+            check=True
+        )
+        return
+
+    except Exception:
+        pass  # fallback below
+
+    # ---- FALLBACK: megatools (megadl) ----
     subprocess.run(
-        ["megadl", "--recursive", "--path", DOWNLOAD_DIR, url],
+        ["megadl", "--path", DOWNLOAD_DIR, url],
         check=True
     )
 
 # ---------- M3U8 DETECTION ----------
 def extract_m3u8(url):
-    """
-    Uses yt-dlp to print m3u8 URL without downloading
-    """
     try:
         p = subprocess.run(
             [
@@ -131,9 +151,8 @@ def download_ytdlp(url, out):
         subprocess.run(base_cmd, check=True)
         return
     except subprocess.CalledProcessError:
-        pass  # fallback below
+        pass
 
-    # ---- m3u8 fallback ----
     m3u8 = extract_m3u8(url)
     if not m3u8:
         raise Exception("yt-dlp failed and no m3u8 found")
