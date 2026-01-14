@@ -7,7 +7,7 @@ import requests
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# ============== CONFIG ==============
+# ================= CONFIG =================
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
@@ -27,7 +27,23 @@ app = Client(
     session_string=SESSION_STRING,
 )
 
-# ============== HELPERS ==============
+# ================= HELPERS =================
+
+def is_direct_video(url):
+    return url.lower().split("?")[0].endswith(
+        (".mp4", ".mkv", ".webm", ".avi", ".mov")
+    )
+
+def is_hls(url):
+    return ".m3u8" in url.lower()
+
+def download_direct(url, path):
+    r = requests.get(url, stream=True, timeout=30)
+    r.raise_for_status()
+    with open(path, "wb") as f:
+        for chunk in r.iter_content(1024 * 1024):
+            if chunk:
+                f.write(chunk)
 
 def download_pixeldrain(fid, path):
     r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
@@ -37,13 +53,13 @@ def download_pixeldrain(fid, path):
             if c:
                 f.write(c)
 
-def download_ytdlp(url, out_path):
+def download_ytdlp(url, out):
     cmd = [
         "yt-dlp",
         "--no-playlist",
         "-f", "bv*+ba/b",
         "--merge-output-format", "mp4",
-        "-o", out_path,
+        "-o", out,
         url
     ]
     subprocess.run(cmd, check=True)
@@ -55,6 +71,7 @@ def convert_mp4(src):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    os.remove(src)
     return dst
 
 def split_file(path):
@@ -63,24 +80,24 @@ def split_file(path):
     count = math.ceil(size / SPLIT_SIZE)
     with open(path, "rb") as f:
         for i in range(count):
-            p = f"{path}.part{i+1}.mp4"
-            with open(p, "wb") as o:
+            part = f"{path}.part{i+1}.mp4"
+            with open(part, "wb") as o:
                 o.write(f.read(SPLIT_SIZE))
-            parts.append(p)
+            parts.append(part)
     os.remove(path)
     return parts
 
-# ============== BOT ==============
+# ================= BOT =================
 
 @app.on_message(filters.private & filters.text)
 async def handler(_, m: Message):
     url = m.text.strip()
-    status = await m.reply("🔍 Processing link...")
+    status = await m.reply("🔍 Detecting link type...")
 
     try:
         files = []
 
-        # PIXELDRAIN
+        # ---------- PIXELDRAIN ----------
         px = PIXELDRAIN_RE.search(url)
         if px:
             fid = px.group(1)
@@ -93,16 +110,34 @@ async def handler(_, m: Message):
             download_pixeldrain(fid, path)
             files.append(path)
 
-        # ANY OTHER URL (mp4 / m3u8 / streaming)
+        # ---------- DIRECT VIDEO ----------
+        elif is_direct_video(url):
+            filename = url.split("/")[-1].split("?")[0]
+            path = os.path.join(DOWNLOAD_DIR, filename)
+
+            await status.edit("⬇️ Direct video download")
+            download_direct(url, path)
+            files.append(path)
+
+        # ---------- HLS / M3U8 ----------
+        elif is_hls(url):
+            await status.edit("📡 Downloading HLS stream")
+            out = os.path.join(DOWNLOAD_DIR, "video.%(ext)s")
+            download_ytdlp(url, out)
+
+            for f in os.listdir(DOWNLOAD_DIR):
+                files.append(os.path.join(DOWNLOAD_DIR, f))
+
+        # ---------- WEB PAGE ----------
         else:
-            await status.edit("🎥 Extracting video via yt-dlp")
+            await status.edit("🎥 Extracting via yt-dlp")
             out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
             download_ytdlp(url, out)
 
             for f in os.listdir(DOWNLOAD_DIR):
                 files.append(os.path.join(DOWNLOAD_DIR, f))
 
-        # PROCESS FILES
+        # ---------- PROCESS ----------
         for f in files:
             path = f
 
@@ -123,7 +158,7 @@ async def handler(_, m: Message):
                 )
                 os.remove(p)
 
-        await status.edit("✅ Done & cleaned")
+        await status.edit("✅ Completed & cleaned")
 
     except Exception as e:
         await status.edit(f"❌ Error:\n`{e}`")
