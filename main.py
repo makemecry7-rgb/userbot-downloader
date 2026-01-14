@@ -86,8 +86,37 @@ def download_mega(url):
         check=True
     )
 
-# ---------- GOFILE ----------
-def download_gofile(folder_id):
+# ---------- GOFILE (PUBLIC) ----------
+def download_gofile_public(folder_id):
+    r = requests.get(f"https://api.gofile.io/contents/{folder_id}", timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
+    if data.get("status") != "ok":
+        raise Exception("Public GoFile API failed")
+
+    contents = data["data"]["contents"]
+
+    for _, info in contents.items():
+        if info["type"] != "file":
+            continue
+
+        name = info["name"]
+        if not name.lower().endswith(ALLOWED_EXT):
+            continue
+
+        url = info["link"]
+        path = os.path.join(DOWNLOAD_DIR, name)
+
+        with requests.get(url, stream=True) as d:
+            d.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in d.iter_content(1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+# ---------- GOFILE (TOKEN FALLBACK) ----------
+def download_gofile_token(folder_id):
     if not GOFILE_TOKEN:
         raise Exception("GOFILE_TOKEN not set")
 
@@ -97,17 +126,18 @@ def download_gofile(folder_id):
 
     r = requests.get(
         f"https://api.gofile.io/contents/{folder_id}",
-        headers=headers
+        headers=headers,
+        timeout=20
     )
     r.raise_for_status()
     data = r.json()
 
     if data.get("status") != "ok":
-        raise Exception("GoFile API error")
+        raise Exception("Token GoFile API failed")
 
     contents = data["data"]["contents"]
 
-    for fid, info in contents.items():
+    for _, info in contents.items():
         if info["type"] != "file":
             continue
 
@@ -202,9 +232,13 @@ async def handler(_, m: Message):
             await status.edit("⬇️ Downloading from Pixeldrain...")
             download_pixeldrain(fid, path)
 
-        elif GOFILE_RE.search(url):
-            await status.edit("⬇️ Downloading from GoFile...")
-            download_gofile(GOFILE_RE.search(url).group(1))
+        elif (gf := GOFILE_RE.search(url)):
+            await status.edit("⬇️ Downloading from GoFile (public)...")
+            try:
+                download_gofile_public(gf.group(1))
+            except Exception:
+                await status.edit("🔐 Public blocked, trying token...")
+                download_gofile_token(gf.group(1))
 
         elif MEGA_RE.search(url):
             await status.edit("⬇️ Downloading from MEGA...")
