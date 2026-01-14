@@ -20,8 +20,7 @@ SPLIT_SIZE = 1900 * 1024 * 1024
 COOKIES_FILE = "cookies.txt"
 
 ALLOWED_EXT = (
-    ".mp4", ".mkv", ".webm", ".avi", ".mov",
-    ".jpg", ".jpeg", ".png", ".webp"
+    ".mp4", ".mkv", ".webm", ".avi", ".mov"
 )
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -62,39 +61,6 @@ def collect_files(root):
                 result.append(path)
     return result
 
-def is_direct_video(url):
-    return url.lower().split("?")[0].endswith(
-        (".mp4", ".mkv", ".webm", ".avi", ".mov")
-    )
-
-def is_hls(url):
-    return ".m3u8" in url.lower()
-
-# ---------- ARIA2 ----------
-def download_aria2(url, out):
-    cmd = [
-        "aria2c",
-        "-x", "1",
-        "-s", "1",
-        "-k", "1M",
-        "--timeout=20",
-        "--connect-timeout=20",
-        "--file-allocation=trunc",
-        "--header=User-Agent: Mozilla/5.0",
-        "-o", out,
-        url
-    ]
-    subprocess.run(cmd, check=True)
-
-# ---------- DIRECT ----------
-def download_direct(url, path):
-    r = requests.get(url, stream=True, timeout=(10, 30))
-    r.raise_for_status()
-    with open(path, "wb") as f:
-        for c in r.iter_content(1024 * 1024):
-            if c:
-                f.write(c)
-
 # ---------- PIXELDRAIN ----------
 def download_pixeldrain(fid, path):
     r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
@@ -106,20 +72,17 @@ def download_pixeldrain(fid, path):
 
 # ---------- MEGA ----------
 def download_mega(url):
-    cmd = [
-        "megadl",
-        "--recursive",
-        "--path", DOWNLOAD_DIR,
-        url
-    ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(
+        ["megadl", "--recursive", "--path", DOWNLOAD_DIR, url],
+        check=True
+    )
 
 # ---------- YT-DLP ----------
 def download_ytdlp(url, out):
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
 
-    cmd = [
+    subprocess.run([
         "yt-dlp",
         "--no-playlist",
         "--cookies", COOKIES_FILE,
@@ -129,21 +92,27 @@ def download_ytdlp(url, out):
         "--merge-output-format", "mp4",
         "-o", out,
         url
-    ]
-    subprocess.run(cmd, check=True)
+    ], check=True)
 
-# ---------- CONVERT ----------
-def convert_mp4(src):
-    if src.lower().endswith(".mp4"):
-        return src
-    dst = src.rsplit(".", 1)[0] + ".mp4"
+# ---------- FIX STREAMING ----------
+def faststart_and_thumb(src):
+    fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
+    thumb = src.rsplit(".", 1)[0] + ".jpg"
+
     subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", dst],
+        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
     )
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:01", "-vframes", "1", thumb],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
     os.remove(src)
-    return dst
+    return fixed, thumb
 
 # ---------- SPLIT ----------
 def split_file(path):
@@ -166,7 +135,7 @@ def split_file(path):
 @app.on_message(filters.private & filters.text)
 async def handler(_, m: Message):
     url = m.text.strip()
-    status = await m.reply("🔍 Detecting link type...")
+    status = await m.reply("🔍 Processing link...")
 
     try:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
@@ -174,19 +143,11 @@ async def handler(_, m: Message):
 
         # ❌ BUNKR
         if BUNKR_RE.search(url):
-            await status.edit(
-                "❌ **Bunkr blocked on Railway**\n"
-                "Use local VPS to download bunkr."
-            )
+            await status.edit("❌ Bunkr blocked on Railway")
             return
 
-        # MEGA
-        if MEGA_RE.search(url):
-            await status.edit("⬇️ Downloading from MEGA...")
-            download_mega(url)
-
         # PIXELDRAIN
-        elif (px := PIXELDRAIN_RE.search(url)):
+        if (px := PIXELDRAIN_RE.search(url)):
             fid = px.group(1)
             info = requests.get(
                 f"https://pixeldrain.com/api/file/{fid}/info"
@@ -195,48 +156,46 @@ async def handler(_, m: Message):
             await status.edit("⬇️ Downloading from Pixeldrain...")
             download_pixeldrain(fid, path)
 
-        # DIRECT VIDEO
-        elif is_direct_video(url):
-            name = url.split("/")[-1].split("?")[0]
-            path = os.path.join(DOWNLOAD_DIR, name)
-            await status.edit("⚡ Direct downloading...")
-            try:
-                download_aria2(url, path)
-            except Exception:
-                download_direct(url, path)
+        # MEGA
+        elif MEGA_RE.search(url):
+            await status.edit("⬇️ Downloading from MEGA...")
+            download_mega(url)
 
-        # HLS / OTHER
+        # OTHER
         else:
-            await status.edit("🎥 Extracting via yt-dlp...")
+            await status.edit("🎥 Extracting video...")
             out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
             download_ytdlp(url, out)
 
-        # COLLECT FILES
         files = collect_files(DOWNLOAD_DIR)
         if not files:
-            raise Exception("No media files found")
+            raise Exception("No videos found")
 
-        await status.edit(f"📦 Uploading {len(files)} files...")
+        await status.edit(f"📦 Uploading {len(files)} video(s)...")
 
-        # UPLOAD
         for f in files:
-            path = convert_mp4(f)
+            fixed, thumb = faststart_and_thumb(f)
+
             parts = (
-                [path]
-                if os.path.getsize(path) < SPLIT_SIZE
-                else split_file(path)
+                [fixed]
+                if os.path.getsize(fixed) < SPLIT_SIZE
+                else split_file(fixed)
             )
 
             for p in parts:
                 await app.send_video(
                     "me",
                     video=p,
+                    thumb=thumb,
                     supports_streaming=True,
                     caption=os.path.basename(p),
                 )
                 os.remove(p)
 
-        await status.edit("✅ Done & cleaned")
+            if os.path.exists(thumb):
+                os.remove(thumb)
+
+        await status.edit("✅ Done (thumbnail fixed)")
 
     except Exception as e:
         await status.edit(f"❌ Error:\n`{e}`")
