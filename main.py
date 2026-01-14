@@ -4,6 +4,7 @@ import math
 import shutil
 import subprocess
 import requests
+import base64
 from urllib.parse import urlparse
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -16,11 +17,30 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
+COOKIES_FILE = "cookies.txt"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
 BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.(cr|pk|fi|ru)/")
+
+# ================= COOKIES =================
+
+def ensure_cookies():
+    """
+    Create cookies.txt from base64 ENV if not present
+    """
+    if os.path.exists(COOKIES_FILE):
+        return
+
+    data = os.getenv("COOKIES_B64")
+    if data:
+        with open(COOKIES_FILE, "wb") as f:
+            f.write(base64.b64decode(data))
+
+ensure_cookies()
+
+# ================= CLIENT =================
 
 app = Client(
     "userbot",
@@ -54,7 +74,7 @@ def download_direct(url, path):
             timeout=(5, 10)
         )
     except requests.exceptions.ReadTimeout:
-        raise Exception("CDN blocked Railway IP (timeout). Proxy required.")
+        raise Exception("CDN blocked Railway IP (timeout).")
 
     if r.status_code != 200:
         raise Exception(f"Direct download blocked ({r.status_code})")
@@ -79,6 +99,7 @@ def download_ytdlp(url, out):
     cmd = [
         "yt-dlp",
         "--no-playlist",
+        "--cookies", COOKIES_FILE,
         "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "--add-header", f"Referer:{referer}",
         "--add-header", f"Origin:{referer}",
@@ -87,6 +108,7 @@ def download_ytdlp(url, out):
         "-o", out,
         url
     ]
+
     subprocess.run(cmd, check=True)
 
 def convert_mp4(src):
@@ -137,21 +159,21 @@ async def handler(_, m: Message):
             download_pixeldrain(fid, path)
             files.append(path)
 
-        # BUNKR PAGE (IMPORTANT)
+        # BUNKR / WEB PAGE
         elif BUNKR_RE.search(url):
-            await status.edit("🎥 Extracting video from bunkr page...")
+            await status.edit("🎥 Extracting via yt-dlp...")
             out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
             download_ytdlp(url, out)
+            files.extend(
+                os.path.join(DOWNLOAD_DIR, f)
+                for f in os.listdir(DOWNLOAD_DIR)
+            )
 
-            for f in os.listdir(DOWNLOAD_DIR):
-                files.append(os.path.join(DOWNLOAD_DIR, f))
-
-        # DIRECT MP4
+        # DIRECT VIDEO
         elif is_direct_video(url):
             filename = url.split("/")[-1].split("?")[0]
             path = os.path.join(DOWNLOAD_DIR, filename)
-
-            await status.edit("⬇️ Connecting to CDN...")
+            await status.edit("⬇️ Downloading direct video...")
             download_direct(url, path)
             files.append(path)
 
@@ -160,18 +182,20 @@ async def handler(_, m: Message):
             await status.edit("📡 Downloading HLS stream...")
             out = os.path.join(DOWNLOAD_DIR, "video.%(ext)s")
             download_ytdlp(url, out)
+            files.extend(
+                os.path.join(DOWNLOAD_DIR, f)
+                for f in os.listdir(DOWNLOAD_DIR)
+            )
 
-            for f in os.listdir(DOWNLOAD_DIR):
-                files.append(os.path.join(DOWNLOAD_DIR, f))
-
-        # OTHER WEB PAGES
+        # OTHER SITES
         else:
             await status.edit("🎥 Extracting via yt-dlp...")
             out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
             download_ytdlp(url, out)
-
-            for f in os.listdir(DOWNLOAD_DIR):
-                files.append(os.path.join(DOWNLOAD_DIR, f))
+            files.extend(
+                os.path.join(DOWNLOAD_DIR, f)
+                for f in os.listdir(DOWNLOAD_DIR)
+            )
 
         # UPLOAD
         for f in files:
