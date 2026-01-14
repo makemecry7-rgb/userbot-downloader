@@ -10,9 +10,13 @@ from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
 # ================= CONFIG =================
-API_ID = int(os.getenv("API_ID"))
+
+API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH")
-SESSION = os.getenv("SESSION", "userbot")
+SESSION_STRING = os.getenv("SESSION_STRING")
+
+if not API_ID or not API_HASH or not SESSION_STRING:
+    raise RuntimeError("Missing API_ID / API_HASH / SESSION_STRING env variables")
 
 DOWNLOAD_DIR = "downloads"
 COOKIES_FILE = "cookies.txt"
@@ -125,14 +129,16 @@ async def upload_file(app: Client, msg: Message, path: str):
     )
 
 
-# ================= Handler =================
+# ================= CLIENT =================
 
 app = Client(
-    SESSION,
+    session_string=SESSION_STRING,
     api_id=API_ID,
     api_hash=API_HASH
 )
 
+
+# ================= Handler =================
 
 @app.on_message(filters.private & filters.text)
 async def handler(client: Client, message: Message):
@@ -153,5 +159,5 @@ async def handler(client: Client, message: Message):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
-print("Userbot started")
+print("✅ Userbot started (session string)")
 app.run()
