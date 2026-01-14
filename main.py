@@ -6,6 +6,7 @@ import subprocess
 import requests
 import base64
 from urllib.parse import urlparse
+
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -14,6 +15,7 @@ from pyrogram.types import Message
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
+GOFILE_TOKEN = os.getenv("GOFILE_TOKEN")
 
 DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024
@@ -27,6 +29,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
 MEGA_RE = re.compile(r"https?://mega\.nz/")
+GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
 BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.(cr|pk|fi|ru)/")
 
 # ================= COOKIES =================
@@ -62,7 +65,6 @@ def collect_files(root):
     return files
 
 def normalize_mega_url(url: str) -> str:
-    # megadl CANNOT handle /folder/... sub paths
     if "/folder/" in url:
         return url.split("/folder/")[0]
     return url
@@ -84,7 +86,46 @@ def download_mega(url):
         check=True
     )
 
-# ---------- YT-DLP ----------
+# ---------- GOFILE ----------
+def download_gofile(folder_id):
+    if not GOFILE_TOKEN:
+        raise Exception("GOFILE_TOKEN not set")
+
+    headers = {
+        "Authorization": f"Bearer {GOFILE_TOKEN}"
+    }
+
+    r = requests.get(
+        f"https://api.gofile.io/contents/{folder_id}",
+        headers=headers
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    if data.get("status") != "ok":
+        raise Exception("GoFile API error")
+
+    contents = data["data"]["contents"]
+
+    for fid, info in contents.items():
+        if info["type"] != "file":
+            continue
+
+        name = info["name"]
+        if not name.lower().endswith(ALLOWED_EXT):
+            continue
+
+        path = os.path.join(DOWNLOAD_DIR, name)
+        url = info["link"]
+
+        with requests.get(url, stream=True) as d:
+            d.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in d.iter_content(1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+# ---------- YT-DLP (UNCHANGED) ----------
 def download_ytdlp(url, out):
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
@@ -148,12 +189,10 @@ async def handler(_, m: Message):
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        # ❌ BUNKR (Railway blocked)
         if BUNKR_RE.search(url):
             await status.edit("❌ Bunkr is blocked on Railway")
             return
 
-        # PIXELDRAIN
         if (px := PIXELDRAIN_RE.search(url)):
             fid = px.group(1)
             info = requests.get(
@@ -163,12 +202,14 @@ async def handler(_, m: Message):
             await status.edit("⬇️ Downloading from Pixeldrain...")
             download_pixeldrain(fid, path)
 
-        # MEGA
+        elif GOFILE_RE.search(url):
+            await status.edit("⬇️ Downloading from GoFile...")
+            download_gofile(GOFILE_RE.search(url).group(1))
+
         elif MEGA_RE.search(url):
             await status.edit("⬇️ Downloading from MEGA...")
             download_mega(url)
 
-        # OTHER (HLS / MP4 / WEBPAGE)
         else:
             await status.edit("🎥 Extracting video...")
             out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
