@@ -3,9 +3,8 @@ import re
 import math
 import shutil
 import subprocess
-import requests
+import asyncio
 import base64
-import time
 from urllib.parse import urlparse
 
 from pyrogram import Client, filters
@@ -18,17 +17,10 @@ API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024
 COOKIES_FILE = "cookies.txt"
-
-ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
+SPLIT_SIZE = 1900 * 1024 * 1024
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
-GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
-MEGA_RE = re.compile(r"https?://mega\.nz/")
-BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.")
 
 # ================= COOKIES =================
 
@@ -53,128 +45,13 @@ app = Client(
 
 # ================= HELPERS =================
 
-def collect_files(root):
-    out = []
-    for b, _, names in os.walk(root):
-        for n in names:
-            p = os.path.join(b, n)
-            if p.lower().endswith(ALLOWED_EXT):
-                out.append(p)
-    return out
-
-# ================= PIXELDRAIN =================
-
-def download_pixeldrain(fid, path):
-    r = requests.get(
-        f"https://pixeldrain.com/api/file/{fid}",
-        stream=True,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    with open(path, "wb") as f:
-        for c in r.iter_content(1024 * 1024):
-            if c:
-                f.write(c)
-
-# ================= GOFILE (AUTO RETRY) =================
-
-GOFILE_WT_LIST = [
-    "4fd6sg89d7s6",
-    "d7f7s6f9d8s7",
-    "a8f7d6s9f8d7",
-]
-
-def download_gofile_public(folder_id):
-    last_error = None
-
-    for wt in GOFILE_WT_LIST:
-        try:
-            r = requests.get(
-                f"https://api.gofile.io/contents/{folder_id}",
-                params={"wt": wt, "cache": "true"},
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept": "application/json",
-                    "Referer": "https://gofile.io/",
-                    "Origin": "https://gofile.io",
-                },
-                timeout=30,
-            )
-
-            if r.status_code == 401:
-                raise Exception("401 Unauthorized")
-
-            r.raise_for_status()
-            data = r.json()
-
-            if data.get("status") != "ok":
-                raise Exception("Invalid GoFile response")
-
-            contents = data["data"]["contents"]
-
-            for f in contents.values():
-                if f.get("type") != "file":
-                    continue
-
-                name = f["name"]
-                if not name.lower().endswith(ALLOWED_EXT):
-                    continue
-
-                path = os.path.join(DOWNLOAD_DIR, name)
-                url = f["link"]
-
-                with requests.get(url, stream=True) as d:
-                    d.raise_for_status()
-                    with open(path, "wb") as o:
-                        for chunk in d.iter_content(1024 * 1024):
-                            if chunk:
-                                o.write(chunk)
-
-            return  # ✅ SUCCESS
-
-        except Exception as e:
-            last_error = e
-            time.sleep(2)
-
-    raise Exception(f"GoFile failed after retries: {last_error}")
-
-# ================= MEGA =================
-
-def download_mega(url):
-    subprocess.run(
-        ["megadl", "--recursive", "--path", DOWNLOAD_DIR, url],
-        check=True,
-    )
-
-# ================= YT-DLP (UNCHANGED) =================
-
-def download_ytdlp(url, out):
-    parsed = urlparse(url)
-    ref = f"{parsed.scheme}://{parsed.netloc}/"
-
-    subprocess.run(
-        [
-            "yt-dlp",
-            "--no-playlist",
-            "--cookies",
-            COOKIES_FILE,
-            "--user-agent",
-            "Mozilla/5.0",
-            "--add-header",
-            f"Referer:{ref}",
-            "--add-header",
-            f"Origin:{ref}",
-            "--merge-output-format",
-            "mp4",
-            "-o",
-            out,
-            url,
-        ],
-        check=True,
-    )
-
-# ================= STREAM FIX =================
+def collect_files():
+    files = []
+    for f in os.listdir(DOWNLOAD_DIR):
+        p = os.path.join(DOWNLOAD_DIR, f)
+        if os.path.isfile(p):
+            files.append(p)
+    return files
 
 def faststart(src):
     fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
@@ -193,57 +70,86 @@ def split_file(path):
 
     with open(path, "rb") as f:
         for i in range(count):
-            p = f"{path}.part{i+1}.mp4"
-            with open(p, "wb") as o:
+            part = f"{path}.part{i+1}.mp4"
+            with open(part, "wb") as o:
                 o.write(f.read(SPLIT_SIZE))
-            parts.append(p)
+            parts.append(part)
 
     os.remove(path)
     return parts
+
+# ================= YT-DLP WITH PROGRESS =================
+
+async def ytdlp_download(url, status_msg):
+    out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+
+    cmd = [
+        "yt-dlp",
+        "--newline",
+        "--no-playlist",
+        "--cookies", COOKIES_FILE,
+        "--merge-output-format", "mp4",
+        "-o", out,
+        url
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT
+    )
+
+    last_edit = 0
+
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+
+        text = line.decode(errors="ignore").strip()
+
+        if "[download]" in text and "%" in text:
+            now = asyncio.get_event_loop().time()
+            if now - last_edit < 1.2:
+                continue
+            last_edit = now
+
+            # example line:
+            # [download]  34.5% of 120.43MiB at 2.34MiB/s ETA 00:51
+            await status_msg.edit(
+                "⬇️ **Downloading**\n\n"
+                f"`{text}`"
+            )
+
+    code = await process.wait()
+    if code != 0:
+        raise Exception("yt-dlp failed")
 
 # ================= HANDLER =================
 
 @app.on_message(filters.private & filters.text)
 async def handler(_, m: Message):
-    text = (m.text or "").strip()
-    if not text.startswith("http"):
+    url = (m.text or "").strip()
+    if not url.startswith("http"):
         return
 
-    status = await m.reply("🔍 Processing...")
+    status = await m.reply("🔍 Detecting video...")
 
     try:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        if BUNKR_RE.search(text):
-            await status.edit("❌ Bunkr blocked on Railway")
-            return
+        await ytdlp_download(url, status)
 
-        if (px := PIXELDRAIN_RE.search(text)):
-            await status.edit("⬇️ Pixeldrain...")
-            info = requests.get(
-                f"https://pixeldrain.com/api/file/{px.group(1)}/info"
-            ).json()
-            download_pixeldrain(px.group(1), os.path.join(DOWNLOAD_DIR, info["name"]))
-
-        elif (gf := GOFILE_RE.search(text)):
-            await status.edit("⬇️ GoFile (retry enabled)...")
-            download_gofile_public(gf.group(1))
-
-        elif MEGA_RE.search(text):
-            await status.edit("⬇️ MEGA...")
-            download_mega(text)
-
-        else:
-            await status.edit("🎥 yt-dlp...")
-            download_ytdlp(text, os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"))
-
-        files = collect_files(DOWNLOAD_DIR)
+        files = collect_files()
         if not files:
-            raise Exception("No video files found")
+            raise Exception("No files downloaded")
+
+        await status.edit("📦 Processing video...")
 
         for f in files:
             fixed = faststart(f)
+
             parts = (
                 [fixed]
                 if os.path.getsize(fixed) < SPLIT_SIZE
