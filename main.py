@@ -15,7 +15,6 @@ from pyrogram.types import Message
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
-GOFILE_TOKEN = os.getenv("GOFILE_TOKEN")
 
 DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024
@@ -26,8 +25,8 @@ ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)", re.I)
-MEGA_RE = re.compile(r"https?://mega\.nz/", re.I)
 GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)", re.I)
+MEGA_RE = re.compile(r"https?://mega\.nz/", re.I)
 BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.", re.I)
 
 # ================= COOKIES =================
@@ -35,10 +34,10 @@ BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.", re.I)
 def ensure_cookies():
     if os.path.exists(COOKIES_FILE):
         return
-    data = os.getenv("COOKIES_B64")
-    if data:
+    b64 = os.getenv("COOKIES_B64")
+    if b64:
         with open(COOKIES_FILE, "wb") as f:
-            f.write(base64.b64decode(data))
+            f.write(base64.b64decode(b64))
 
 ensure_cookies()
 
@@ -48,7 +47,7 @@ app = Client(
     "userbot",
     api_id=API_ID,
     api_hash=API_HASH,
-    session_string=SESSION_STRING,
+    session_string=SESSION_STRING
 )
 
 # ================= HELPERS =================
@@ -62,7 +61,7 @@ def collect_files(root):
                 out.append(p)
     return out
 
-def normalize_mega_url(url):
+def normalize_mega(url):
     return url.split("/folder/")[0]
 
 # ================= DOWNLOADERS =================
@@ -75,12 +74,6 @@ def download_pixeldrain(fid, path):
             if c:
                 f.write(c)
 
-def download_mega(url):
-    subprocess.run(
-        ["megadl", "--recursive", "--path", DOWNLOAD_DIR, normalize_mega_url(url)],
-        check=True
-    )
-
 def download_gofile_public(fid):
     r = requests.get(
         f"https://api.gofile.io/contents/{fid}",
@@ -91,17 +84,27 @@ def download_gofile_public(fid):
     r.raise_for_status()
     data = r.json()
     if data.get("status") != "ok":
-        raise Exception("GoFile public blocked")
+        raise Exception("GoFile blocked")
 
     for info in data["data"]["contents"].values():
-        if info["type"] == "file" and info["name"].lower().endswith(ALLOWED_EXT):
-            path = os.path.join(DOWNLOAD_DIR, info["name"])
-            with requests.get(info["link"], stream=True) as d:
-                d.raise_for_status()
-                with open(path, "wb") as f:
-                    for c in d.iter_content(1024 * 1024):
-                        if c:
-                            f.write(c)
+        if info["type"] != "file":
+            continue
+        if not info["name"].lower().endswith(ALLOWED_EXT):
+            continue
+
+        path = os.path.join(DOWNLOAD_DIR, info["name"])
+        with requests.get(info["link"], stream=True) as d:
+            d.raise_for_status()
+            with open(path, "wb") as f:
+                for c in d.iter_content(1024 * 1024):
+                    if c:
+                        f.write(c)
+
+def download_mega(url):
+    subprocess.run(
+        ["megadl", "--recursive", "--path", DOWNLOAD_DIR, normalize_mega(url)],
+        check=True
+    )
 
 def download_ytdlp(url, out):
     p = urlparse(url)
@@ -118,14 +121,20 @@ def download_ytdlp(url, out):
         url
     ], check=True)
 
+# ================= VIDEO FIX =================
+
 def faststart_and_thumb(src):
     fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
     thumb = src.rsplit(".", 1)[0] + ".jpg"
 
-    subprocess.run(["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["ffmpeg", "-y", "-i", fixed, "-ss", "1", "-vframes", "1", thumb],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", fixed, "-ss", "1", "-vframes", "1", thumb],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
     os.remove(src)
     return fixed, thumb
 
@@ -147,13 +156,13 @@ def split_file(path):
 
 # ================= HANDLER =================
 
-@app.on_message(filters.text & ~filters.edited)
+@app.on_message(filters.text)
 async def handler(_, m: Message):
     text = (m.text or "").strip()
     if not text.startswith("http"):
         return
 
-    status = await m.reply("🔍 Link detected")
+    status = await m.reply("🔍 Processing link...")
 
     try:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
@@ -165,7 +174,9 @@ async def handler(_, m: Message):
 
         if (px := PIXELDRAIN_RE.search(text)):
             await status.edit("⬇️ Pixeldrain")
-            info = requests.get(f"https://pixeldrain.com/api/file/{px.group(1)}/info").json()
+            info = requests.get(
+                f"https://pixeldrain.com/api/file/{px.group(1)}/info"
+            ).json()
             download_pixeldrain(px.group(1), os.path.join(DOWNLOAD_DIR, info["name"]))
 
         elif (gf := GOFILE_RE.search(text)):
@@ -184,12 +195,20 @@ async def handler(_, m: Message):
         if not files:
             raise Exception("Nothing downloaded")
 
+        await status.edit("📦 Uploading...")
+
         for f in files:
             fixed, thumb = faststart_and_thumb(f)
             parts = [fixed] if os.path.getsize(fixed) < SPLIT_SIZE else split_file(fixed)
 
             for p in parts:
-                await app.send_video("me", p, thumb=thumb, supports_streaming=True)
+                await app.send_video(
+                    "me",
+                    video=p,
+                    thumb=thumb,
+                    supports_streaming=True
+                )
+                os.remove(p)
 
             if os.path.exists(thumb):
                 os.remove(thumb)
@@ -197,6 +216,6 @@ async def handler(_, m: Message):
         await status.edit("✅ Done")
 
     except Exception as e:
-        await status.edit(f"❌ {e}")
+        await status.edit(f"❌ Error:\n`{e}`")
 
 app.run()
