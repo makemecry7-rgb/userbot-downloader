@@ -15,7 +15,7 @@ API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
+SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB safe
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -73,15 +73,9 @@ def convert_to_mp4(src):
 def extract_thumbnail(video_path):
     thumb = video_path + ".jpg"
     subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-ss", "00:00:01",
-            "-vframes", "1",
-            thumb
-        ],
+        ["ffmpeg", "-y", "-i", video_path, "-ss", "00:00:01", "-vframes", "1", thumb],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.DEVNULL,
     )
     return thumb
 
@@ -103,4 +97,76 @@ def split_file(path):
 
 # =============== BOT ==================
 
-@app.on_m_
+@app.on_message(filters.private & filters.text)
+async def handler(client: Client, message: Message):
+    text = message.text.strip()
+
+    px = PIXELDRAIN_RE.search(text)
+    gf = GOFILE_RE.search(text)
+
+    if not px and not gf:
+        return
+
+    status = await message.reply("🔍 Fetching info...")
+
+    try:
+        files = []
+
+        if px:
+            fid = px.group(1)
+            info = requests.get(
+                f"https://pixeldrain.com/api/file/{fid}/info"
+            ).json()
+            files.append({
+                "name": info["name"],
+                "url": f"https://pixeldrain.com/api/file/{fid}",
+            })
+        else:
+            cid = gf.group(1)
+            data = requests.get(
+                f"https://api.gofile.io/getContent?contentId={cid}"
+            ).json()
+            for f in data["data"]["contents"].values():
+                if f["type"] == "file":
+                    files.append({
+                        "name": f["name"],
+                        "url": f["link"],
+                    })
+
+        for item in files:
+            filename = item["name"]
+            filepath = os.path.join(DOWNLOAD_DIR, filename)
+
+            await status.edit(f"📥 Downloading\n{filename}")
+            download_with_progress(item["url"], filepath, status)
+
+            if not filepath.lower().endswith(".mp4"):
+                await status.edit("🎬 Converting to MP4")
+                new_path = convert_to_mp4(filepath)
+                os.remove(filepath)
+                filepath = new_path
+
+            parts = split_file(filepath) if os.path.getsize(filepath) > SPLIT_SIZE else [filepath]
+
+            for i, part in enumerate(parts, 1):
+                await status.edit(f"📤 Uploading part {i}/{len(parts)}")
+                thumb = extract_thumbnail(part)
+
+                await message.reply_video(
+                    video=part,
+                    thumb=thumb,
+                    supports_streaming=True,
+                    caption=os.path.basename(part),
+                )
+
+                os.remove(thumb)
+                os.remove(part)
+
+        await status.edit("✅ Done & cleaned")
+
+    except Exception as e:
+        await status.edit(f"❌ Error:\n`{e}`")
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+app.run()
