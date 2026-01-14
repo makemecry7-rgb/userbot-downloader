@@ -25,11 +25,11 @@ COOKIES_FILE = "cookies.txt"
 
 ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
 
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
 MEGA_RE = re.compile(r"https?://mega\.nz/")
 BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.")
+
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ================= COOKIES =================
 
@@ -43,21 +43,19 @@ def ensure_cookies():
 
 ensure_cookies()
 
-# ================= CLIENT (SAFE USERBOT) =================
+# ================= CLIENT =================
 
 app = Client(
     "userbot",
     api_id=API_ID,
     api_hash=API_HASH,
     session_string=SESSION_STRING,
-    skip_updates=True   # 🔥 REQUIRED FOR USERBOTS
+    skip_updates=True
 )
 
-# ================= GLOBALS =================
+# ================= HELPERS =================
 
 edit_lock = asyncio.Lock()
-
-# ================= HELPERS =================
 
 async def safe_edit(msg, text):
     async with edit_lock:
@@ -69,9 +67,9 @@ async def safe_edit(msg, text):
         except Exception:
             pass
 
-def collect_files(root):
+def collect_files():
     out = []
-    for b, _, f in os.walk(root):
+    for b, _, f in os.walk(DOWNLOAD_DIR):
         for n in f:
             p = os.path.join(b, n)
             if p.lower().endswith(ALLOWED_EXT):
@@ -79,28 +77,13 @@ def collect_files(root):
     return out
 
 # ---------- PIXELDRAIN ----------
-def download_pixeldrain(fid, path, progress):
+def download_pixeldrain(fid, path):
     r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
     r.raise_for_status()
-
-    total = int(r.headers.get("Content-Length", 0))
-    done = 0
-    last = time.time()
-
     with open(path, "wb") as f:
         for c in r.iter_content(1024 * 1024):
-            if not c:
-                continue
-            f.write(c)
-            done += len(c)
-
-            if time.time() - last > 2:
-                percent = done * 100 / total if total else 0
-                asyncio.run_coroutine_threadsafe(
-                    safe_edit(progress, f"⬇️ Pixeldrain `{percent:.1f}%`"),
-                    app.loop
-                )
-                last = time.time()
+            if c:
+                f.write(c)
 
 # ---------- MEGA ----------
 def download_mega(url):
@@ -110,7 +93,7 @@ def download_mega(url):
     )
 
 # ---------- YT-DLP ----------
-def download_ytdlp(url, out, progress):
+async def download_ytdlp(url, out, status):
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
 
@@ -125,40 +108,46 @@ def download_ytdlp(url, out, progress):
         url
     ]
 
-    p = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT
     )
 
     last = time.time()
-    for line in p.stdout:
+    async for line in proc.stdout:
+        line = line.decode()
         if "[download]" in line and "%" in line:
-            if time.time() - last > 2:
-                asyncio.run_coroutine_threadsafe(
-                    safe_edit(progress, f"⬇️ {line.strip()}"),
-                    app.loop
-                )
+            if time.time() - last > 2.5:
+                await safe_edit(status, f"⬇️ {line.strip()}")
                 last = time.time()
 
-    if p.wait() != 0:
+    if await proc.wait() != 0:
         raise Exception("yt-dlp failed")
 
-# ---------- FIX STREAMING + THUMB ----------
+# ---------- FIX STREAMING + AV1 THUMB ----------
 def faststart_and_thumb(src):
     base, _ = os.path.splitext(src)
     fixed = base + "_fixed.mp4"
     thumb = base + ".jpg"
 
+    # Faststart copy
     subprocess.run(
         ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
 
+    # AV1-safe thumbnail (re-encode ONE frame)
     subprocess.run(
-        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:02", "-vframes", "1", thumb],
+        [
+            "ffmpeg", "-y",
+            "-i", fixed,
+            "-ss", "00:00:02",
+            "-frames:v", "1",
+            "-q:v", "2",
+            thumb
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
@@ -204,7 +193,7 @@ async def handler(_, m: Message):
         if (px := PIXELDRAIN_RE.search(url)):
             await safe_edit(status, "⬇️ Pixeldrain...")
             info = requests.get(f"https://pixeldrain.com/api/file/{px.group(1)}/info").json()
-            download_pixeldrain(px.group(1), os.path.join(DOWNLOAD_DIR, info["name"]), status)
+            download_pixeldrain(px.group(1), os.path.join(DOWNLOAD_DIR, info["name"]))
 
         elif MEGA_RE.search(url):
             await safe_edit(status, "⬇️ MEGA...")
@@ -212,15 +201,14 @@ async def handler(_, m: Message):
 
         else:
             await safe_edit(status, "🎥 Downloading video...")
-            download_ytdlp(url, os.path.join(DOWNLOAD_DIR, "%(title).80s.%(ext)s"), status)
+            await download_ytdlp(url, os.path.join(DOWNLOAD_DIR, "%(title).80s.%(ext)s"), status)
 
-        files = collect_files(DOWNLOAD_DIR)
+        files = collect_files()
         if not files:
             raise Exception("No video found")
 
         for f in files:
             fixed, thumb = faststart_and_thumb(f)
-
             parts = [fixed] if os.path.getsize(fixed) < SPLIT_SIZE else split_file(fixed)
 
             for p in parts:
@@ -228,7 +216,7 @@ async def handler(_, m: Message):
                     chat_id="me",
                     video=p,
                     supports_streaming=True,
-                    caption=os.path.basename(p),
+                    caption=os.path.basename(p)
                 )
                 if thumb:
                     kwargs["thumb"] = thumb
