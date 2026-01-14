@@ -15,22 +15,20 @@ from pyrogram.types import Message
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
-GOFILE_TOKEN = os.getenv("GOFILE_TOKEN")  # optional fallback
+GOFILE_TOKEN = os.getenv("GOFILE_TOKEN")
 
 DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024
 COOKIES_FILE = "cookies.txt"
 
-ALLOWED_EXT = (
-    ".mp4", ".mkv", ".webm", ".avi", ".mov"
-)
+ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
-MEGA_RE = re.compile(r"https?://mega\.nz/")
-GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
-BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.(cr|pk|fi|ru)/")
+PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)", re.I)
+MEGA_RE = re.compile(r"https?://mega\.nz/", re.I)
+GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)", re.I)
+BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.", re.I)
 
 # ================= COOKIES =================
 
@@ -57,21 +55,18 @@ app = Client(
 
 def collect_files(root):
     out = []
-    for base, _, files in os.walk(root):
-        for f in files:
-            p = os.path.join(base, f)
+    for b, _, fs in os.walk(root):
+        for f in fs:
+            p = os.path.join(b, f)
             if p.lower().endswith(ALLOWED_EXT):
                 out.append(p)
     return out
 
 def normalize_mega_url(url):
-    if "/folder/" in url:
-        return url.split("/folder/")[0]
-    return url
+    return url.split("/folder/")[0]
 
 # ================= DOWNLOADERS =================
 
-# ---------- PIXELDRAIN ----------
 def download_pixeldrain(fid, path):
     r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
     r.raise_for_status()
@@ -80,83 +75,37 @@ def download_pixeldrain(fid, path):
             if c:
                 f.write(c)
 
-# ---------- MEGA ----------
 def download_mega(url):
     subprocess.run(
         ["megadl", "--recursive", "--path", DOWNLOAD_DIR, normalize_mega_url(url)],
         check=True
     )
 
-# ---------- GOFILE (PUBLIC FIXED) ----------
-def download_gofile_public(folder_id):
+def download_gofile_public(fid):
     r = requests.get(
-        f"https://api.gofile.io/contents/{folder_id}",
+        f"https://api.gofile.io/contents/{fid}",
         params={"wt": "4fd6sg89d7s6"},
         headers={"User-Agent": "Mozilla/5.0"},
         timeout=20
     )
     r.raise_for_status()
     data = r.json()
-
     if data.get("status") != "ok":
-        raise Exception("Public GoFile blocked")
+        raise Exception("GoFile public blocked")
 
     for info in data["data"]["contents"].values():
-        if info["type"] != "file":
-            continue
+        if info["type"] == "file" and info["name"].lower().endswith(ALLOWED_EXT):
+            path = os.path.join(DOWNLOAD_DIR, info["name"])
+            with requests.get(info["link"], stream=True) as d:
+                d.raise_for_status()
+                with open(path, "wb") as f:
+                    for c in d.iter_content(1024 * 1024):
+                        if c:
+                            f.write(c)
 
-        name = info["name"]
-        if not name.lower().endswith(ALLOWED_EXT):
-            continue
-
-        path = os.path.join(DOWNLOAD_DIR, name)
-        with requests.get(info["link"], stream=True) as d:
-            d.raise_for_status()
-            with open(path, "wb") as f:
-                for chunk in d.iter_content(1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-
-# ---------- GOFILE (TOKEN FALLBACK) ----------
-def download_gofile_token(folder_id):
-    if not GOFILE_TOKEN:
-        raise Exception("GOFILE_TOKEN not set")
-
-    r = requests.get(
-        f"https://api.gofile.io/contents/{folder_id}",
-        headers={
-            "Authorization": f"Bearer {GOFILE_TOKEN}",
-            "User-Agent": "Mozilla/5.0"
-        },
-        timeout=20
-    )
-    r.raise_for_status()
-    data = r.json()
-
-    if data.get("status") != "ok":
-        raise Exception("Token GoFile blocked")
-
-    for info in data["data"]["contents"].values():
-        if info["type"] != "file":
-            continue
-
-        name = info["name"]
-        if not name.lower().endswith(ALLOWED_EXT):
-            continue
-
-        path = os.path.join(DOWNLOAD_DIR, name)
-        with requests.get(info["link"], stream=True) as d:
-            d.raise_for_status()
-            with open(path, "wb") as f:
-                for chunk in d.iter_content(1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-
-# ---------- YT-DLP (UNCHANGED) ----------
 def download_ytdlp(url, out):
     p = urlparse(url)
     ref = f"{p.scheme}://{p.netloc}/"
-
     subprocess.run([
         "yt-dlp",
         "--no-playlist",
@@ -169,97 +118,78 @@ def download_ytdlp(url, out):
         url
     ], check=True)
 
-# ---------- FIX STREAMING ----------
 def faststart_and_thumb(src):
     fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
     thumb = src.rsplit(".", 1)[0] + ".jpg"
 
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:01", "-vframes", "1", thumb],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
+    subprocess.run(["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["ffmpeg", "-y", "-i", fixed, "-ss", "1", "-vframes", "1", thumb],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.remove(src)
     return fixed, thumb
 
-# ---------- SPLIT ----------
 def split_file(path):
-    size = os.path.getsize(path)
-    parts = math.ceil(size / SPLIT_SIZE)
-    out = []
-
+    parts = []
     with open(path, "rb") as f:
-        for i in range(parts):
-            p = f"{path}.part{i+1}.mp4"
+        i = 1
+        while True:
+            chunk = f.read(SPLIT_SIZE)
+            if not chunk:
+                break
+            p = f"{path}.part{i}.mp4"
             with open(p, "wb") as o:
-                o.write(f.read(SPLIT_SIZE))
-            out.append(p)
-
+                o.write(chunk)
+            parts.append(p)
+            i += 1
     os.remove(path)
-    return out
+    return parts
 
-# ================= USERBOT =================
+# ================= HANDLER =================
 
-@app.on_message(filters.private & filters.text)
+@app.on_message(filters.text & ~filters.edited)
 async def handler(_, m: Message):
-    url = m.text.strip()
-    status = await m.reply("🔍 Processing...")
+    text = (m.text or "").strip()
+    if not text.startswith("http"):
+        return
+
+    status = await m.reply("🔍 Link detected")
 
     try:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        if BUNKR_RE.search(url):
-            await status.edit("❌ Bunkr blocked on Railway")
+        if BUNKR_RE.search(text):
+            await status.edit("❌ Bunkr blocked")
             return
 
-        if (px := PIXELDRAIN_RE.search(url)):
-            await status.edit("⬇️ Pixeldrain...")
+        if (px := PIXELDRAIN_RE.search(text)):
+            await status.edit("⬇️ Pixeldrain")
             info = requests.get(f"https://pixeldrain.com/api/file/{px.group(1)}/info").json()
             download_pixeldrain(px.group(1), os.path.join(DOWNLOAD_DIR, info["name"]))
 
-        elif (gf := GOFILE_RE.search(url)):
-            await status.edit("⬇️ GoFile (public)...")
-            try:
-                download_gofile_public(gf.group(1))
-            except Exception:
-                await status.edit("🔐 GoFile token fallback...")
-                download_gofile_token(gf.group(1))
-            # ⛔ STOP HERE – NEVER yt-dlp
-        elif MEGA_RE.search(url):
-            await status.edit("⬇️ MEGA...")
-            download_mega(url)
+        elif (gf := GOFILE_RE.search(text)):
+            await status.edit("⬇️ GoFile")
+            download_gofile_public(gf.group(1))
+
+        elif MEGA_RE.search(text):
+            await status.edit("⬇️ MEGA")
+            download_mega(text)
 
         else:
-            await status.edit("🎥 yt-dlp...")
-            download_ytdlp(url, os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"))
+            await status.edit("🎥 yt-dlp")
+            download_ytdlp(text, os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"))
 
         files = collect_files(DOWNLOAD_DIR)
         if not files:
-            raise Exception("No videos found")
-
-        await status.edit(f"📦 Uploading {len(files)} file(s)...")
+            raise Exception("Nothing downloaded")
 
         for f in files:
             fixed, thumb = faststart_and_thumb(f)
             parts = [fixed] if os.path.getsize(fixed) < SPLIT_SIZE else split_file(fixed)
 
             for p in parts:
-                await app.send_video(
-                    "me",
-                    video=p,
-                    thumb=thumb,
-                    supports_streaming=True,
-                    caption=os.path.basename(p)
-                )
-                os.remove(p)
+                await app.send_video("me", p, thumb=thumb, supports_streaming=True)
 
             if os.path.exists(thumb):
                 os.remove(thumb)
@@ -267,10 +197,6 @@ async def handler(_, m: Message):
         await status.edit("✅ Done")
 
     except Exception as e:
-        await status.edit(f"❌ Error:\n`{e}`")
-
-    finally:
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        await status.edit(f"❌ {e}")
 
 app.run()
