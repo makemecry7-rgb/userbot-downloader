@@ -8,14 +8,14 @@ import subprocess
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# ================= CONFIG =================
+# =============== CONFIG ===============
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
+SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB safe
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -26,7 +26,6 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Accept": "application/json",
     "Referer": "https://gofile.io/",
-    "Origin": "https://gofile.io",
 }
 
 app = Client(
@@ -36,7 +35,7 @@ app = Client(
     session_string=SESSION_STRING,
 )
 
-# ================= HELPERS =================
+# =============== HELPERS ===============
 
 def human(size):
     for u in ["B", "KB", "MB", "GB"]:
@@ -104,44 +103,32 @@ def split_file(path):
 
 
 def get_gofile_files(content_id):
-    # Step 1: get server
-    r = requests.get(
-        "https://api.gofile.io/getServer",
-        headers=HEADERS,
-        timeout=15
-    )
-    r.raise_for_status()
-    server = r.json()["data"]["server"]
+    url = f"https://api.gofile.io/contents/{content_id}"
 
-    # Step 2: get content
-    r = requests.get(
-        f"https://{server}.gofile.io/getContent",
-        headers=HEADERS,
-        params={"contentId": content_id, "details": "true"},
-        timeout=20
-    )
+    r = requests.get(url, headers=HEADERS, timeout=20)
 
     if not r.text.strip().startswith("{"):
-        raise Exception("Gofile blocked request (HTML/empty response)")
+        raise Exception("Gofile blocked request (HTML / empty response)")
 
     data = r.json()
+
     if data.get("status") != "ok":
-        raise Exception("Gofile API error")
+        raise Exception("Gofile API error or restricted link")
 
     files = []
-    for f in data["data"]["contents"].values():
-        if f.get("type") == "file":
+    for item in data["data"]["children"].values():
+        if item.get("type") == "file":
             files.append({
-                "name": f["name"],
-                "url": f["link"],
+                "name": item["name"],
+                "url": item["link"],
             })
 
     if not files:
-        raise Exception("No files found in Gofile folder")
+        raise Exception("No downloadable files found")
 
     return files
 
-# ================= BOT =================
+# =============== BOT ===============
 
 @app.on_message(filters.private & filters.text)
 async def handler(client: Client, message: Message):
