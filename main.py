@@ -19,6 +19,11 @@ DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024
 COOKIES_FILE = "cookies.txt"
 
+ALLOWED_EXT = (
+    ".mp4", ".mkv", ".webm", ".avi", ".mov",
+    ".jpg", ".jpeg", ".png", ".webp"
+)
+
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
@@ -48,6 +53,15 @@ app = Client(
 
 # ================= HELPERS =================
 
+def collect_files(root):
+    result = []
+    for base, _, files in os.walk(root):
+        for f in files:
+            path = os.path.join(base, f)
+            if path.lower().endswith(ALLOWED_EXT):
+                result.append(path)
+    return result
+
 def is_direct_video(url):
     return url.lower().split("?")[0].endswith(
         (".mp4", ".mkv", ".webm", ".avi", ".mov")
@@ -67,13 +81,12 @@ def download_aria2(url, out):
         "--connect-timeout=20",
         "--file-allocation=trunc",
         "--header=User-Agent: Mozilla/5.0",
-        "--header=Accept:*/*",
         "-o", out,
         url
     ]
     subprocess.run(cmd, check=True)
 
-# ---------- DIRECT FALLBACK ----------
+# ---------- DIRECT ----------
 def download_direct(url, path):
     r = requests.get(url, stream=True, timeout=(10, 30))
     r.raise_for_status()
@@ -95,6 +108,7 @@ def download_pixeldrain(fid, path):
 def download_mega(url):
     cmd = [
         "megadl",
+        "--recursive",
         "--path", DOWNLOAD_DIR,
         url
     ]
@@ -109,8 +123,6 @@ def download_ytdlp(url, out):
         "yt-dlp",
         "--no-playlist",
         "--cookies", COOKIES_FILE,
-        "--downloader", "aria2c",
-        "--downloader-args", "aria2c:-x 1 -s 1 -k 1M",
         "--user-agent", "Mozilla/5.0",
         "--add-header", f"Referer:{referer}",
         "--add-header", f"Origin:{referer}",
@@ -122,6 +134,8 @@ def download_ytdlp(url, out):
 
 # ---------- CONVERT ----------
 def convert_mp4(src):
+    if src.lower().endswith(".mp4"):
+        return src
     dst = src.rsplit(".", 1)[0] + ".mp4"
     subprocess.run(
         ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", dst],
@@ -147,21 +161,22 @@ def split_file(path):
     os.remove(path)
     return parts
 
-# ================= BOT =================
+# ================= USERBOT =================
 
 @app.on_message(filters.private & filters.text)
 async def handler(_, m: Message):
     url = m.text.strip()
-    status = await m.reply("🔍 Processing link...")
+    status = await m.reply("🔍 Detecting link type...")
 
     try:
-        files = []
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         # ❌ BUNKR
         if BUNKR_RE.search(url):
             await status.edit(
                 "❌ **Bunkr blocked on Railway**\n"
-                "Run bot locally to download bunkr."
+                "Use local VPS to download bunkr."
             )
             return
 
@@ -169,10 +184,6 @@ async def handler(_, m: Message):
         if MEGA_RE.search(url):
             await status.edit("⬇️ Downloading from MEGA...")
             download_mega(url)
-            files.extend(
-                os.path.join(DOWNLOAD_DIR, f)
-                for f in os.listdir(DOWNLOAD_DIR)
-            )
 
         # PIXELDRAIN
         elif (px := PIXELDRAIN_RE.search(url)):
@@ -181,37 +192,35 @@ async def handler(_, m: Message):
                 f"https://pixeldrain.com/api/file/{fid}/info"
             ).json()
             path = os.path.join(DOWNLOAD_DIR, info["name"])
-            await status.edit("⬇️ Pixeldrain downloading...")
+            await status.edit("⬇️ Downloading from Pixeldrain...")
             download_pixeldrain(fid, path)
-            files.append(path)
 
-        # DIRECT MP4
+        # DIRECT VIDEO
         elif is_direct_video(url):
             name = url.split("/")[-1].split("?")[0]
             path = os.path.join(DOWNLOAD_DIR, name)
-            await status.edit("⚡ Direct download...")
+            await status.edit("⚡ Direct downloading...")
             try:
                 download_aria2(url, path)
             except Exception:
                 download_direct(url, path)
-            files.append(path)
 
         # HLS / OTHER
         else:
-            await status.edit("🎥 Extracting video...")
+            await status.edit("🎥 Extracting via yt-dlp...")
             out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
             download_ytdlp(url, out)
-            files.extend(
-                os.path.join(DOWNLOAD_DIR, f)
-                for f in os.listdir(DOWNLOAD_DIR)
-            )
+
+        # COLLECT FILES
+        files = collect_files(DOWNLOAD_DIR)
+        if not files:
+            raise Exception("No media files found")
+
+        await status.edit(f"📦 Uploading {len(files)} files...")
 
         # UPLOAD
         for f in files:
-            path = f
-            if not path.lower().endswith(".mp4"):
-                path = convert_mp4(path)
-
+            path = convert_mp4(f)
             parts = (
                 [path]
                 if os.path.getsize(path) < SPLIT_SIZE
@@ -219,7 +228,8 @@ async def handler(_, m: Message):
             )
 
             for p in parts:
-                await m.reply_video(
+                await app.send_video(
+                    "me",
                     video=p,
                     supports_streaming=True,
                     caption=os.path.basename(p),
@@ -230,6 +240,7 @@ async def handler(_, m: Message):
 
     except Exception as e:
         await status.edit(f"❌ Error:\n`{e}`")
+    finally:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
