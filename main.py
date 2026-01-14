@@ -1,129 +1,56 @@
 import os
 import re
 import math
-import shutil
+import time
+import asyncio
 import subprocess
-import requests
-import base64
-from urllib.parse import urlparse
 
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
-# ================= CONFIG =================
-
+# ============ CONFIG ============
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
+SESSION = os.getenv("SESSION", "userbot")
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
-COOKIES_FILE = "cookies.txt"
-
-ALLOWED_VIDEO_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
-
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ================= REGEX =================
-
-PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
+# ============ REGEX ============
 MEGA_RE = re.compile(r"https?://mega\.nz/")
-BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.")
+URL_RE = re.compile(r"https?://")
 
-# ================= COOKIES =================
+# ============ UTILS ============
 
-def ensure_cookies():
-    if os.path.exists(COOKIES_FILE):
-        return
-    data = os.getenv("COOKIES_B64")
-    if data:
-        with open(COOKIES_FILE, "wb") as f:
-            f.write(base64.b64decode(data))
+def human(n):
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if n < 1024:
+            return f"{n:.2f}{unit}"
+        n /= 1024
+    return "∞"
 
-ensure_cookies()
+def progress_bar(done, total):
+    if total == 0:
+        return "▱" * 10
+    percent = done / total
+    filled = int(percent * 10)
+    return "▰" * filled + "▱" * (10 - filled)
 
-# ================= CLIENT =================
+async def edit_progress(msg, text):
+    try:
+        await msg.edit(text)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+    except:
+        pass
 
-app = Client(
-    "userbot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-)
-
-# ================= HELPERS =================
-
-def collect_videos(root):
-    out = []
-    for b, _, fs in os.walk(root):
-        for f in fs:
-            p = os.path.join(b, f)
-            if p.lower().endswith(ALLOWED_VIDEO_EXT):
-                out.append(p)
-    return out
-
-# ================= PIXELDRAIN =================
-
-def download_pixeldrain(fid, path):
-    r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
-    r.raise_for_status()
-    with open(path, "wb") as f:
-        for c in r.iter_content(1024 * 1024):
-            if c:
-                f.write(c)
-
-# ================= MEGA (FIXED) =================
-
-def download_mega(url):
-    env = os.environ.copy()
-    env["HOME"] = "/root"
-
-    # Start MEGA daemon (required in Docker)
-    subprocess.run(
-        ["mega-cmd-server"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=env,
-        check=False
-    )
-
-    subprocess.run(
-        [
-            "mega-get",
-            "--ignore-quota-warn",
-            "--recursive",
-            url,
-            DOWNLOAD_DIR
-        ],
-        env=env,
-        check=True
-    )
-
-# ================= VIDEO (yt-dlp) =================
-
-def download_ytdlp(url, out):
-    parsed = urlparse(url)
-    referer = f"{parsed.scheme}://{parsed.netloc}/"
-
-    subprocess.run(
-        [
-            "yt-dlp",
-            "--cookies", COOKIES_FILE,
-            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "--referer", referer,
-            "--merge-output-format", "mp4",
-            "--no-playlist",
-            "-o", out,
-            url
-        ],
-        check=True
-    )
-
-# ================= FASTSTART + THUMB =================
+# ============ THUMB + FASTSTART ============
 
 def faststart_and_thumb(src):
-    fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
-    thumb = src.rsplit(".", 1)[0] + ".jpg"
+    base, _ = os.path.splitext(src)
+    fixed = base + "_fixed.mp4"
+    thumb = base + ".jpg"
 
     subprocess.run(
         ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
@@ -132,104 +59,138 @@ def faststart_and_thumb(src):
     )
 
     subprocess.run(
-        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:01", "-vframes", "1", thumb],
+        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:02", "-vframes", "1", thumb],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
 
-    os.remove(src)
+    if os.path.exists(src):
+        os.remove(src)
+
+    if not os.path.exists(thumb):
+        thumb = None
+
     return fixed, thumb
 
-# ================= SPLIT =================
+# ============ YT-DLP DOWNLOAD ============
 
-def split_file(path):
-    parts = []
-    size = os.path.getsize(path)
-    count = math.ceil(size / SPLIT_SIZE)
+async def ytdlp_download(url, msg):
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--merge-output-format", "mp4",
+        "--newline",
+        "-o", f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
+        url
+    ]
 
-    with open(path, "rb") as f:
-        for i in range(count):
-            part = f"{path}.part{i+1}.mp4"
-            with open(part, "wb") as o:
-                o.write(f.read(SPLIT_SIZE))
-            parts.append(part)
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
 
-    os.remove(path)
-    return parts
+    last_update = time.time()
 
-# ================= BOT =================
+    for line in process.stdout:
+        if "[download]" in line and "%" in line:
+            try:
+                percent = float(line.split("%")[0].split()[-1])
+                bar = progress_bar(percent, 100)
+                if time.time() - last_update > 1.2:
+                    await edit_progress(
+                        msg,
+                        f"⬇️ **Downloading**\n{bar} `{percent:.2f}%`"
+                    )
+                    last_update = time.time()
+            except:
+                pass
 
-@app.on_message(filters.private & filters.text)
-async def handler(_, m: Message):
-    url = m.text.strip()
-    status = await m.reply("🔍 Processing link...")
+    process.wait()
+    if process.returncode != 0:
+        raise Exception("yt-dlp failed")
+
+# ============ MEGA DOWNLOAD ============
+
+async def mega_download(url, msg):
+    cmd = ["mega-get", "--ignore-quota-warn", "--recursive", url, DOWNLOAD_DIR]
+
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+
+    last_update = time.time()
+
+    for line in process.stdout:
+        if "%" in line:
+            try:
+                percent = float(line.split("%")[0].strip())
+                bar = progress_bar(percent, 100)
+                if time.time() - last_update > 1.5:
+                    await edit_progress(
+                        msg,
+                        f"⬇️ **Downloading from MEGA**\n{bar} `{percent:.2f}%`"
+                    )
+                    last_update = time.time()
+            except:
+                pass
+
+    process.wait()
+    if process.returncode != 0:
+        raise Exception("MEGA download failed")
+
+# ============ SEND FILES ============
+
+async def send_all(app, msg):
+    for root, _, files in os.walk(DOWNLOAD_DIR):
+        for f in files:
+            path = os.path.join(root, f)
+
+            if f.lower().endswith(".mp4"):
+                fixed, thumb = faststart_and_thumb(path)
+
+                kwargs = dict(
+                    chat_id="me",
+                    video=fixed,
+                    supports_streaming=True,
+                    caption=os.path.basename(fixed)
+                )
+                if thumb:
+                    kwargs["thumb"] = thumb
+
+                await app.send_video(**kwargs)
+
+                os.remove(fixed)
+                if thumb and os.path.exists(thumb):
+                    os.remove(thumb)
+
+            else:
+                await app.send_document("me", path)
+                os.remove(path)
+
+# ============ BOT ============
+
+app = Client(SESSION, api_id=API_ID, api_hash=API_HASH)
+
+@app.on_message(filters.me & filters.text)
+async def handler(_, message: Message):
+    text = message.text.strip()
+
+    if not URL_RE.search(text):
+        return
+
+    status = await message.reply("🔄 **Starting download...**")
 
     try:
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-        # Blocked
-        if BUNKR_RE.search(url):
-            await status.edit("❌ Bunkr is blocked on Railway")
-            return
-
-        # Pixeldrain
-        if (px := PIXELDRAIN_RE.search(url)):
-            fid = px.group(1)
-            info = requests.get(
-                f"https://pixeldrain.com/api/file/{fid}/info"
-            ).json()
-
-            path = os.path.join(DOWNLOAD_DIR, info["name"])
-            await status.edit("⬇️ Downloading from Pixeldrain...")
-            download_pixeldrain(fid, path)
-
-        # MEGA
-        elif MEGA_RE.search(url):
-            await status.edit("⬇️ Downloading from MEGA...")
-            download_mega(url)
-
-        # Video sites
+        if MEGA_RE.search(text):
+            await mega_download(text, status)
         else:
-            await status.edit("🎥 Downloading video...")
-            out = os.path.join(DOWNLOAD_DIR, "%(title).80s.%(ext)s")
-            download_ytdlp(url, out)
+            await ytdlp_download(text, status)
 
-        files = collect_videos(DOWNLOAD_DIR)
-        if not files:
-            raise Exception("No video files found")
+        await edit_progress(status, "📤 **Uploading...**")
+        await send_all(app, status)
 
-        await status.edit(f"📦 Uploading {len(files)} file(s)...")
-
-        for f in files:
-            fixed, thumb = faststart_and_thumb(f)
-
-            parts = (
-                [fixed]
-                if os.path.getsize(fixed) < SPLIT_SIZE
-                else split_file(fixed)
-            )
-
-            for p in parts:
-                await app.send_video(
-                    "me",
-                    video=p,
-                    thumb=thumb,
-                    supports_streaming=True,
-                    caption=os.path.basename(p),
-                )
-                os.remove(p)
-
-            if os.path.exists(thumb):
-                os.remove(thumb)
-
-        await status.edit("✅ Done")
+        await status.edit("✅ **Done! Sent to Saved Messages**")
 
     except Exception as e:
-        await status.edit(f"❌ Error:\n`{e}`")
-
-    finally:
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        await status.edit(f"❌ **Failed**\n`{e}`")
 
 app.run()
