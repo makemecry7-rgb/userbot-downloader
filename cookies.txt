@@ -1,0 +1,7 @@
+# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+bunkr.cr	FALSE	/	FALSE	1802858021	UGVyc2lzdFN0b3JhZ2U	%7B%22CAIFRQ%22%3A%22ADl2TQAAAAAAAAAB%22%2C%22CAIFRT%22%3A%22ADl2TQAAAABpaHRQ%22%7D
+bunkr.cr	FALSE	/	FALSE	0	bnState_2085344	%7B%22impressions%22%3A1%2C%22delayStarted%22%3A0%7D
+bunkr.cr	FALSE	/	FALSE	0	__PPU_ppucnt	1
