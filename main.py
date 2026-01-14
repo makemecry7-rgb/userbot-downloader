@@ -20,6 +20,7 @@ SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
+BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.(cr|pk|fi|ru)/")
 
 app = Client(
     "userbot",
@@ -40,19 +41,23 @@ def is_hls(url):
 
 def download_direct(url, path):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "User-Agent": "Mozilla/5.0",
         "Accept": "*/*",
         "Referer": url
     }
 
-    r = requests.get(url, headers=headers, stream=True, timeout=15)
+    try:
+        r = requests.get(
+            url,
+            headers=headers,
+            stream=True,
+            timeout=(5, 10)
+        )
+    except requests.exceptions.ReadTimeout:
+        raise Exception("CDN blocked Railway IP (timeout). Proxy required.")
 
     if r.status_code != 200:
         raise Exception(f"Direct download blocked ({r.status_code})")
-
-    ctype = r.headers.get("Content-Type", "")
-    if "video" not in ctype and "octet-stream" not in ctype:
-        raise Exception(f"Not a video (Content-Type: {ctype})")
 
     with open(path, "wb") as f:
         for chunk in r.iter_content(1024 * 1024):
@@ -78,7 +83,6 @@ def download_ytdlp(url, out):
         "--add-header", f"Referer:{referer}",
         "--add-header", f"Origin:{referer}",
         "--hls-use-mpegts",
-        "--allow-unplayable-formats",
         "--merge-output-format", "mp4",
         "-o", out,
         url
@@ -120,7 +124,7 @@ async def handler(_, m: Message):
     try:
         files = []
 
-        # ---------- PIXELDRAIN ----------
+        # PIXELDRAIN
         px = PIXELDRAIN_RE.search(url)
         if px:
             fid = px.group(1)
@@ -133,17 +137,25 @@ async def handler(_, m: Message):
             download_pixeldrain(fid, path)
             files.append(path)
 
-        # ---------- DIRECT VIDEO ----------
+        # BUNKR PAGE (IMPORTANT)
+        elif BUNKR_RE.search(url):
+            await status.edit("🎥 Extracting video from bunkr page...")
+            out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+            download_ytdlp(url, out)
+
+            for f in os.listdir(DOWNLOAD_DIR):
+                files.append(os.path.join(DOWNLOAD_DIR, f))
+
+        # DIRECT MP4
         elif is_direct_video(url):
             filename = url.split("/")[-1].split("?")[0]
             path = os.path.join(DOWNLOAD_DIR, filename)
 
             await status.edit("⬇️ Connecting to CDN...")
             download_direct(url, path)
-            await status.edit("⬆️ Uploading video...")
             files.append(path)
 
-        # ---------- HLS / M3U8 ----------
+        # HLS
         elif is_hls(url):
             await status.edit("📡 Downloading HLS stream...")
             out = os.path.join(DOWNLOAD_DIR, "video.%(ext)s")
@@ -152,19 +164,18 @@ async def handler(_, m: Message):
             for f in os.listdir(DOWNLOAD_DIR):
                 files.append(os.path.join(DOWNLOAD_DIR, f))
 
-        # ---------- WEB PAGE ----------
+        # OTHER WEB PAGES
         else:
-            await status.edit("🎥 Extracting video via yt-dlp...")
+            await status.edit("🎥 Extracting via yt-dlp...")
             out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
             download_ytdlp(url, out)
 
             for f in os.listdir(DOWNLOAD_DIR):
                 files.append(os.path.join(DOWNLOAD_DIR, f))
 
-        # ---------- PROCESS & UPLOAD ----------
+        # UPLOAD
         for f in files:
             path = f
-
             if not path.lower().endswith(".mp4"):
                 path = convert_mp4(path)
 
@@ -182,7 +193,7 @@ async def handler(_, m: Message):
                 )
                 os.remove(p)
 
-        await status.edit("✅ Completed & cleaned")
+        await status.edit("✅ Done & cleaned")
 
     except Exception as e:
         await status.edit(f"❌ Error:\n`{e}`")
