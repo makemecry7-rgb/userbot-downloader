@@ -126,8 +126,10 @@ def faststart_and_thumb(src):
         ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
+
+    # 🔥 ONLY CHANGE: thumbnail at 1 minute
     subprocess.run(
-        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:01", "-vframes", "1", thumb],
+        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:01:00", "-vframes", "1", thumb],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
