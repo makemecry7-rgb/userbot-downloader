@@ -59,42 +59,64 @@ def collect_files(root):
                 files.append(p)
     return files
 
-# ---------- GOFILE DOWNLOADER (MULTI-VIDEO SUPPORT) ----------
+# ---------- GOFILE DOWNLOADER (FIXED API LOGIC) ----------
 async def download_gofile(content_id, status_msg):
     headers = {"Authorization": f"Bearer {GOFILE_API_TOKEN}", "User-Agent": UA}
-    res = requests.get(f"api.gofile.io{content_id}", headers=headers)
+    # Corrected API endpoint for 2026 GoFile API
+    api_url = f"api.gofile.io{content_id}"
+    res = requests.get(api_url, headers=headers)
+    
     if res.status_code != 200:
-        raise Exception(f"GoFile API {res.status_code}. Token might be invalid.")
+        raise Exception(f"GoFile API Error {res.status_code}. Check if GOFILE_API_TOKEN is correct.")
     
     data = res.json()
-    contents = data["data"].get("children", data["data"].get("contents", {}))
+    if data.get("status") != "ok":
+        raise Exception(f"GoFile API returned status: {data.get('status')}")
+
+    # Accessing the children (files) in the folder
+    contents = data["data"].get("contents", data["data"].get("children", {}))
     
-    video_items = [item for item in contents.values() if item["type"] == "file"]
+    video_items = [item for item in contents.values() if item.get("type") == "file"]
+    if not video_items:
+        raise Exception("No files found in this GoFile link.")
+        
     total = len(video_items)
     
     for i, item in enumerate(video_items, 1):
         tag = f"Downloading Video {i}/{total}"
-        out_path = os.path.join(DOWNLOAD_DIR, item["name"])
+        file_name = item["name"]
+        out_path = os.path.join(DOWNLOAD_DIR, file_name)
+        direct_link = item["directLink"]
         
-        with requests.get(item["directLink"], headers=headers, stream=True) as r:
+        # Download using requests with token to bypass cookie/referer issues
+        with requests.get(direct_link, headers=headers, stream=True) as r:
             r.raise_for_status()
             file_total = int(r.headers.get('content-length', 0))
             current = 0
             with open(out_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024*1024):
-                    f.write(chunk)
-                    current += len(chunk)
-                    await progress_func(current, file_total, status_msg, tag)
+                    if chunk:
+                        f.write(chunk)
+                        current += len(chunk)
+                        await progress_func(current, file_total, status_msg, tag)
 
 # ---------- YT-DLP CORE ----------
 def download_ytdlp(url, out_pattern):
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
     cmd = [
-        "yt-dlp", "--no-playlist", "--cookies", COOKIES_FILE, "--user-agent", UA,
-        "--add-header", f"Referer:{referer}", "--merge-output-format", "mp4",
+        "yt-dlp", "--no-playlist", 
+        "--cookies", COOKIES_FILE, 
+        "--user-agent", UA,
+        "--add-header", f"Referer:{referer}", 
+        "--merge-output-format", "mp4",
         "-o", out_pattern, url
     ]
+    # If cookies.txt is missing on Railway, yt-dlp will proceed without it
+    if not os.path.exists(COOKIES_FILE):
+        cmd.pop(cmd.index("--cookies") + 1)
+        cmd.remove("--cookies")
+        
     subprocess.run(cmd, check=True)
 
 # ---------- VIDEO PROCESSING ----------
@@ -121,10 +143,8 @@ def split_file(path):
 
 # ================= USERBOT HANDLER =================
 
-# Updated filter: triggers only for messages you send to yourself (Saved Messages)
 @app.on_message(filters.me & filters.private & filters.text)
 async def handler(client, m: Message):
-    # Security: Ensure this is actually the Saved Messages chat
     if m.chat.id != client.me.id:
         return
 
@@ -137,7 +157,7 @@ async def handler(client, m: Message):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         if (gf := GOFILE_RE.search(url)):
-            await status.edit("📁 GoFile folder detected. Fetching all videos...")
+            await status.edit("📁 GoFile folder detected. Fetching via API...")
             await download_gofile(gf.group(1), status)
         elif (px := PIXELDRAIN_RE.search(url)):
             await status.edit("💧 Pixeldrain detected...")
