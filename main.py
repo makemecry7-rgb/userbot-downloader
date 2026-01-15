@@ -128,56 +128,52 @@ def get_gofile_files(content_id):
     if not GOFILE_API_TOKEN:
         raise Exception("GOFILE_API_TOKEN not set")
 
-    # 1️⃣ Get dynamic API server
-    s = requests.get(
-        "https://api.gofile.io/getServer",
-        timeout=15
-    ).json()
-
+    # 1. Get the dynamic API server (Required for uploads/downloads)
+    s = requests.get("https://api.gofile.io/getServer", timeout=15).json()
     if s.get("status") != "ok":
         raise Exception("Failed to get GoFile server")
-
     server = s["data"]["server"]
 
-    # 2️⃣ Call getContent on correct server
+    # 2. Call getContent - Ensure you use the specific account-based headers
+    # Note: This endpoint now requires a Premium account as of 2025/2026.
     r = requests.get(
-        f"https://{server}.gofile.io/getContent",
+        f"api.gofile.io{content_id}",
         headers={
             "Authorization": f"Bearer {GOFILE_API_TOKEN}",
-            "User-Agent": "Mozilla/5.0",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json"
-        },
-        params={
-            "contentId": content_id,
-            "token": GOFILE_API_TOKEN,
-            "wt": "4fd6sg89d7s6"
         },
         timeout=30
     )
 
     if r.status_code == 404:
-        raise Exception("GoFile link not found or blocked")
-
+        raise Exception("GoFile link not found or content is private")
+    if r.status_code == 429:
+        raise Exception("Rate limit exceeded - GoFile enforces strict limits in 2026")
     if r.status_code != 200:
-        raise Exception(f"GoFile HTTP {r.status_code}")
+        raise Exception(f"GoFile HTTP {r.status_code}: {r.text}")
 
-    try:
-        data = r.json()
-    except Exception:
-        raise Exception("GoFile returned non-JSON response")
-
+    data = r.json()
     if data.get("status") != "ok":
-        raise Exception(f"GoFile API error: {data}")
+        # Handle the specific 'premium_only' error common in 2026
+        error_msg = data.get("error", "Unknown API error")
+        raise Exception(f"GoFile API error: {error_msg}")
 
+    # 3. Extract direct links from the 'children' or 'contents' object
     files = []
-    for item in data["data"]["contents"].values():
-        if item["type"] == "file":
+    contents = data["data"].get("children", data["data"].get("contents", {}))
+    
+    for item_id, item in contents.items():
+        if item.get("type") == "file":
+            # directLink is valid but may require the Bearer token to download
             files.append((item["name"], item["directLink"]))
 
     if not files:
-        raise Exception("No files found in GoFile folder")
+        raise Exception("No files found or folder is empty")
 
     return files
+    
+
 
 
 
