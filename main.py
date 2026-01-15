@@ -16,6 +16,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
 
 # ================= ARIA2 SETUP =================
+# Start aria2 daemon
 subprocess.Popen(["aria2c", "--enable-rpc", "--rpc-listen-all", "--rpc-allow-origin-all", "--max-connection-per-server=16", "--split=16", "--daemon"])
 time.sleep(2)
 aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
@@ -41,16 +42,19 @@ async def aria2_progress(gid, message, tag):
         try:
             download = aria2.get_download(gid)
             if download.is_complete: break
-            if download.has_failed: raise Exception("Aria2 download failed.")
+            if download.has_failed: 
+                raise Exception(f"Aria2 failed: {download.error_message}")
+            
             bar = get_progress_bar(download.completed_length, download.total_length)
-            msg = (f"**{tag}**\n{bar}\n`{download.completed_length_string()} / {download.total_length_string()}`\n🚀 Speed: `{download.download_speed_string()}`")
+            msg = (f"**{tag}**\n{bar}\n"
+                   f"`{download.completed_length_string()} / {download.total_length_string()}`\n"
+                   f"🚀 Speed: `{download.download_speed_string()}`")
             await message.edit(msg)
             await asyncio.sleep(4)
         except: break
 
 def generate_thumbnail(video_path):
     thumb_path = f"{video_path}.jpg"
-    # Captures a frame at 1 second. FFmpeg must be in Dockerfile.
     cmd = ["ffmpeg", "-y", "-i", video_path, "-ss", "00:00:01", "-vframes", "1", thumb_path]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return thumb_path if os.path.exists(thumb_path) else None
@@ -63,12 +67,15 @@ async def download_gofile_aria(content_id, status_msg):
     api_url = f"api.gofile.io{content_id}"
     res = requests.get(api_url, headers=headers)
     if res.status_code != 200:
-        raise Exception(f"GoFile API Error {res.status_code}. Verify Token.")
+        raise Exception(f"GoFile API Error {res.status_code}")
     
     data = res.json()
     contents = data.get("data", {}).get("contents", data.get("data", {}).get("children", {}))
     video_items = [item for item in contents.values() if item.get("type") == "file"]
     
+    if not video_items:
+        raise Exception("No videos found in this folder.")
+
     for i, item in enumerate(video_items, 1):
         tag = f"Leeching {i}/{len(video_items)}"
         options = {"dir": DOWNLOAD_DIR, "out": item["name"], "header": f"Authorization: Bearer {GOFILE_API_TOKEN}"}
@@ -79,26 +86,41 @@ async def download_gofile_aria(content_id, status_msg):
 @app.on_message(filters.me & filters.private & filters.text)
 async def handler(client, m: Message):
     if m.chat.id != client.me.id: return 
+    
     url_match = re.search(r'(https?://[^\s\n]+)', m.text)
     if not url_match: return
     url = url_match.group(1)
     
-    status = await m.reply("🛰️ Initializing Download...")
+    status = await m.reply("🛰️ Processing Link...")
 
     try:
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+        # Clear and rebuild download dir
+        if os.path.exists(DOWNLOAD_DIR):
+            shutil.rmtree(DOWNLOAD_DIR)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         if (gf := GOFILE_RE.search(url)):
-            await status.edit("📁 GoFile detected. Multi-thread leeching...")
+            await status.edit("📁 GoFile folder detected...")
             await download_gofile_aria(gf.group(1), status)
         else:
+            await status.edit("🔗 Direct Link detected...")
             download = aria2.add_uris([url], options={"dir": DOWNLOAD_DIR})
-            await aria2_progress(download.gid, status, "Downloading Link")
+            await aria2_progress(download.gid, status, "Downloading")
 
+        # GET ALL FILES EXCEPT THUMBNAILS
         files = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR) if not f.endswith('.jpg')]
+        
+        if not files:
+            raise Exception("Download directory is empty. Nothing was leached.")
+
         for i, f_path in enumerate(files, 1):
             tag = f"Uploading {i}/{len(files)}"
+            
+            # Check size (Max 2GB for standard userbots)
+            if os.path.getsize(f_path) > 2000 * 1024 * 1024:
+                await status.edit(f"⚠️ `{os.path.basename(f_path)}` is too large (>2GB). Skipping.")
+                continue
+
             thumb = generate_thumbnail(f_path)
             
             await client.send_video(
@@ -110,14 +132,17 @@ async def handler(client, m: Message):
                 progress=tg_progress,
                 progress_args=(status, tag)
             )
+            
             if thumb and os.path.exists(thumb): os.remove(thumb)
             os.remove(f_path)
 
-        await status.edit("✅ Success! Check Saved Messages.")
+        await status.edit("✅ All available videos sent to Saved Messages.")
     except Exception as e:
-        await status.edit(f"❌ Error: `{e}`")
+        await status.edit(f"❌ Error: `{str(e)}`")
     finally:
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+        # Ensure directory is cleaned even on failure
+        if os.path.exists(DOWNLOAD_DIR):
+            shutil.rmtree(DOWNLOAD_DIR)
 
 if __name__ == "__main__":
     app.run()
