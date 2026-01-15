@@ -1,10 +1,9 @@
 import os
-import math
 import shutil
 import subprocess
 import asyncio
-import base64
 import time
+import base64
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -17,21 +16,17 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
 COOKIES_FILE = "cookies.txt"
-SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9 GB
+SPLIT_SIZE = 1900 * 1024 * 1024
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ================= COOKIES =================
 
-def ensure_cookies():
-    if os.path.exists(COOKIES_FILE):
-        return
-    data = os.getenv("COOKIES_B64")
-    if data:
+if not os.path.exists(COOKIES_FILE):
+    b64 = os.getenv("COOKIES_B64")
+    if b64:
         with open(COOKIES_FILE, "wb") as f:
-            f.write(base64.b64decode(data))
-
-ensure_cookies()
+            f.write(base64.b64decode(b64))
 
 # ================= CLIENT =================
 
@@ -42,146 +37,93 @@ app = Client(
     session_string=SESSION_STRING,
 )
 
-# ================= HELPERS =================
+# ================= MP4 FIX (REAL FIX) =================
 
-def collect_files():
-    return [
-        os.path.join(DOWNLOAD_DIR, f)
-        for f in os.listdir(DOWNLOAD_DIR)
-        if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
-    ]
-
-# ---------- SAFE FASTSTART ----------
-
-def faststart(src):
-    fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
-
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", src,
-            "-map", "0",
-            "-c", "copy",
-            "-movflags", "+faststart",
-            fixed
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    if os.path.exists(fixed) and os.path.getsize(fixed) > 0:
-        os.remove(src)
-        return fixed
-    else:
-        if os.path.exists(fixed):
-            os.remove(fixed)
-        return src
-
-# ---------- SAFE MP4 SPLIT (NO BLUE SCREEN) ----------
-
-def split_mp4_ffmpeg(path):
-    base = path.rsplit(".", 1)[0]
-    out_pattern = f"{base}_part%03d.mp4"
-
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", path,
-            "-c", "copy",
-            "-map", "0",
-            "-f", "segment",
-            "-segment_time", "1800",   # ~30 min
-            "-reset_timestamps", "1",
-            out_pattern
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    parts = sorted(
-        os.path.join(DOWNLOAD_DIR, f)
-        for f in os.listdir(DOWNLOAD_DIR)
-        if f.startswith(os.path.basename(base)) and "_part" in f
-    )
-
-    if parts:
-        os.remove(path)
-
-    return parts
-
-# ---------- THUMBNAIL ----------
-
-def generate_thumb(video):
-    thumb = video.rsplit(".", 1)[0] + ".jpg"
-
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-ss", "5",
-            "-i", video,
-            "-vframes", "1",
-            "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
-            "-q:v", "5",
-            thumb
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    if os.path.exists(thumb) and os.path.getsize(thumb) < 200 * 1024:
-        return thumb
-
-    if os.path.exists(thumb):
-        os.remove(thumb)
-    return None
-
-# ================= DOWNLOADERS =================
-
-# ---------- yt-dlp with progress ----------
-
-async def ytdlp_download(url, status):
-    out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+def rebuild_mp4(src):
+    fixed = src.replace(".mp4", "_rebuilt.mp4")
 
     cmd = [
-        "yt-dlp",
-        "--newline",
-        "--no-playlist",
-        "--cookies", COOKIES_FILE,
-        "--merge-output-format", "mp4",
-        "-o", out,
-        url
+        "ffmpeg", "-y",
+        "-fflags", "+genpts",
+        "-i", src,
+        "-map", "0",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        fixed
     ]
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if os.path.exists(fixed) and os.path.getsize(fixed) > 1_000_000:
+        os.remove(src)
+        return fixed
+
+    if os.path.exists(fixed):
+        os.remove(fixed)
+
+    return src
+
+# ================= SPLIT (SIZE SAFE) =================
+
+def split_video(path):
+    size = os.path.getsize(path)
+    if size < SPLIT_SIZE:
+        return [path]
+
+    parts = []
+    base = path.replace(".mp4", "")
+    duration = float(
+        subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration", "-of",
+             "default=noprint_wrappers=1:nokey=1", path]
+        ).decode().strip()
     )
 
-    last = 0
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            break
-        text = line.decode(errors="ignore").strip()
-        if "[download]" in text and "%" in text:
-            now = time.time()
-            if now - last > 1.2:
-                last = now
-                await status.edit(f"⬇️ Downloading\n`{text}`")
+    count = int(size / SPLIT_SIZE) + 1
+    seg_time = int(duration / count)
 
-    if await proc.wait() != 0:
-        raise Exception("yt-dlp failed")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", path,
+            "-map", "0",
+            "-c", "copy",
+            "-f", "segment",
+            "-segment_time", str(seg_time),
+            "-reset_timestamps", "1",
+            f"{base}_part%02d.mp4"
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
 
-# ---------- aria2 fallback with progress ----------
+    for f in sorted(os.listdir(DOWNLOAD_DIR)):
+        if f.startswith(os.path.basename(base)) and "part" in f:
+            parts.append(os.path.join(DOWNLOAD_DIR, f))
+
+    os.remove(path)
+    return parts
+
+# ================= THUMBNAIL =================
+
+def make_thumb(video):
+    thumb = video.replace(".mp4", ".jpg")
+    subprocess.run(
+        ["ffmpeg", "-y", "-ss", "5", "-i", video,
+         "-vframes", "1", thumb],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return thumb if os.path.exists(thumb) else None
+
+# ================= DOWNLOADERS =================
 
 async def aria2_download(url, status):
     cmd = [
         "aria2c",
-        "--summary-interval=1",
-        "-x", "8",
-        "-s", "8",
-        "-k", "1M",
+        "--file-allocation=trunc",
+        "-x", "8", "-s", "8",
         "-d", DOWNLOAD_DIR,
         url
     ]
@@ -192,17 +134,13 @@ async def aria2_download(url, status):
         stderr=asyncio.subprocess.STDOUT
     )
 
-    last = 0
     while True:
         line = await proc.stdout.readline()
         if not line:
             break
-        text = line.decode(errors="ignore").strip()
-        if "%" in text:
-            now = time.time()
-            if now - last > 1.2:
-                last = now
-                await status.edit(f"⬇️ Downloading\n`{text}`")
+        txt = line.decode(errors="ignore")
+        if "%" in txt:
+            await status.edit(f"⬇️ Downloading\n{txt.strip()}")
 
     if await proc.wait() != 0:
         raise Exception("aria2 failed")
@@ -211,77 +149,43 @@ async def aria2_download(url, status):
 
 @app.on_message(filters.private & filters.text)
 async def handler(_, m: Message):
-    url = (m.text or "").strip()
+    url = m.text.strip()
     if not url.startswith("http"):
         return
 
-    status = await m.reply("🔍 Detecting link...")
+    status = await m.reply("⬇️ Starting download...")
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
     try:
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        await aria2_download(url, status)
 
-        # ---------- DOWNLOAD ----------
-        try:
-            await ytdlp_download(url, status)
-        except Exception:
-            await aria2_download(url, status)
-
-        files = collect_files()
+        files = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)]
         if not files:
-            raise Exception("No files downloaded")
+            raise Exception("No file downloaded")
 
-        await status.edit("📦 Processing video...")
-
-        # ---------- PROCESS & UPLOAD ----------
         for f in files:
-            fixed = faststart(f)
-
-            if os.path.getsize(fixed) < SPLIT_SIZE:
-                parts = [fixed]
-            else:
-                parts = split_mp4_ffmpeg(fixed)
-
+            fixed = rebuild_mp4(f)
+            parts = split_video(fixed)
             total = len(parts)
 
-            for i, p in enumerate(parts, start=1):
-                thumb = generate_thumb(p)
-                caption = f"{os.path.basename(p)}\n({i}/{total})"
-
-                last = 0
-
-                async def progress(current, total_size):
-                    nonlocal last
-                    now = time.time()
-                    if now - last > 1.2:
-                        last = now
-                        percent = current * 100 / total_size
-                        await status.edit(
-                            f"⬆️ Uploading {i}/{total}\n"
-                            f"{percent:.1f}%"
-                        )
-
+            for i, p in enumerate(parts, 1):
+                thumb = make_thumb(p)
                 await app.send_video(
                     "me",
-                    video=p,
-                    thumb=thumb,
+                    p,
                     supports_streaming=True,
-                    caption=caption,
-                    progress=progress
+                    thumb=thumb,
+                    caption=f"{os.path.basename(p)} ({i}/{total})"
                 )
-
                 os.remove(p)
-                if thumb and os.path.exists(thumb):
+                if thumb:
                     os.remove(thumb)
 
         await status.edit("✅ Done")
 
     except Exception as e:
-        await status.edit(f"❌ Error:\n`{e}`")
-
-    finally:
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        await status.edit(f"❌ Error:\n{e}")
 
 # ================= RUN =================
 
