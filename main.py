@@ -132,17 +132,32 @@ def get_gofile_files(content_id):
         "https://api.gofile.io/getContent",
         headers={
             "Authorization": f"Bearer {GOFILE_API_TOKEN}",
-            "User-Agent": "Mozilla/5.0"
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json"
         },
-        params={"contentId": content_id},
+        params={
+            "contentId": content_id,
+            "wt": "4fd6sg89d7s6"  # REQUIRED
+        },
         timeout=30
-    ).json()
+    )
 
-    if r.get("status") != "ok":
-        raise Exception("GoFile API failed")
+    if r.status_code != 200:
+        raise Exception(f"GoFile HTTP {r.status_code}")
+
+    if not r.text.strip():
+        raise Exception("GoFile returned empty response (IP blocked or token invalid)")
+
+    try:
+        data = r.json()
+    except Exception:
+        raise Exception("GoFile did not return JSON (token/IP issue)")
+
+    if data.get("status") != "ok":
+        raise Exception(f"GoFile API error: {data}")
 
     files = []
-    for item in r["data"]["contents"].values():
+    for item in data["data"]["contents"].values():
         if item["type"] == "file":
             files.append((item["name"], item["directLink"]))
 
@@ -150,6 +165,7 @@ def get_gofile_files(content_id):
         raise Exception("No files found in GoFile folder")
 
     return files
+
 
 # ================= YT-DLP WITH PROGRESS =================
 
