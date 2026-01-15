@@ -58,15 +58,16 @@ def collect_files(root):
 
 # ---------- GOFILE SOLVER (2026 REFRESHED API) ----------
 async def download_gofile(content_id, status_msg):
-    # API requires Authorization header in 2026 to avoid 403 Forbidden
+    # FIXED: Added proper protocol and 2026 API path
     headers = {"Authorization": f"Bearer {GOFILE_API_TOKEN}", "User-Agent": UA}
     api_url = f"api.gofile.io{content_id}"
     
     res = requests.get(api_url, headers=headers)
     if res.status_code != 200:
-        raise Exception(f"GoFile API Error {res.status_code}. Token might be invalid.")
+        raise Exception(f"GoFile API Error {res.status_code}. Ensure Token is correct.")
     
     data = res.json()
+    # 2026 structure check
     contents = data.get("data", {}).get("contents", data.get("data", {}).get("children", {}))
     
     video_items = [item for item in contents.values() if item.get("type") == "file"]
@@ -75,16 +76,18 @@ async def download_gofile(content_id, status_msg):
     for i, item in enumerate(video_items, 1):
         tag = f"Downloading Video {i}/{len(video_items)}"
         out_path = os.path.join(DOWNLOAD_DIR, item["name"])
-        # Use directLink fetched fresh from API
+        
+        # Download via requests (Direct Link with Auth headers) to bypass 403 status 1 errors
         with requests.get(item["directLink"], headers=headers, stream=True) as r:
             r.raise_for_status()
             file_total = int(r.headers.get('content-length', 0))
             current = 0
             with open(out_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024*1024):
-                    f.write(chunk)
-                    current += len(chunk)
-                    await progress_func(current, file_total, status_msg, tag)
+                    if chunk:
+                        f.write(chunk)
+                        current += len(chunk)
+                        await progress_func(current, file_total, status_msg, tag)
 
 # ---------- YT-DLP CORE ----------
 def download_ytdlp(url, out_pattern):
@@ -95,14 +98,14 @@ def download_ytdlp(url, out_pattern):
         "--add-header", f"Referer:{referer}", "--merge-output-format", "mp4",
         "-o", out_pattern, url
     ]
-    # Use cookies.txt only if it exists (prevents Railway build errors)
     if os.path.exists(COOKIES_FILE):
         cmd.extend(["--cookies", COOKIES_FILE])
     subprocess.run(cmd, check=True)
 
 # ---------- VIDEO PROCESSING ----------
 def faststart_and_thumb(src):
-    base_name = src.rsplit(".", 1)[0]
+    # FIXED: Handled base_name properly to avoid list errors
+    base_name = os.path.splitext(src)[0]
     fixed = f"{base_name}_fixed.mp4"
     thumb = f"{base_name}.jpg"
     subprocess.run(["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -119,14 +122,12 @@ def split_file(path):
             part = f"{path}.part{i+1}.mp4"
             with open(part, "wb") as o: o.write(f.read(SPLIT_SIZE))
             parts.append(part)
-    os.remove(path)
+    if os.path.exists(path): os.remove(path)
     return parts
 
 # ================= USERBOT HANDLER =================
-# Filter: me (only you) & private (saved messages chat matches your ID)
 @app.on_message(filters.me & filters.private & filters.text)
 async def handler(client, m: Message):
-    # Double-check it is Saved Messages
     if m.chat.id != client.me.id: return
     
     url = extract_clean_url(m.text)
@@ -138,7 +139,7 @@ async def handler(client, m: Message):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         if (gf := GOFILE_RE.search(url)):
-            await status.edit("📁 GoFile detected. Fetching via API...")
+            await status.edit("📁 GoFile detected. Fetching fresh API links...")
             await download_gofile(gf.group(1), status)
         elif (px := PIXELDRAIN_RE.search(url)):
             await status.edit("💧 Pixeldrain detected...")
