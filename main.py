@@ -1,4 +1,4 @@
-import os, re, math, shutil, subprocess, requests, time, base64
+import os, re, math, shutil, subprocess, requests, time
 from urllib.parse import urlparse
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -14,40 +14,20 @@ DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024
 COOKIES_FILE = "cookies.txt"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
 ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
+
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
 
 # ================= PROGRESS =================
 
-_progress_cache = {}
-
-def bar(cur, total):
-    pct = (cur / total) * 100 if total else 0
-    filled = int(pct / 10)
-    return f"[{'█'*filled}{'░'*(10-filled)}] {pct:.1f}%"
-
-async def progress_func(current, total, status, tag):
-    now = time.time()
-    key = f"{id(status)}-{tag}"
-
-    last = _progress_cache.get(key, 0)
-    if now - last < 2:
-        return
-    _progress_cache[key] = now
-
-    speed = current / max((now - status.date), 1)
-    eta = (total - current) / speed if speed > 0 else 0
-
+async def upload_progress(current, total, message):
+    pct = (current / total) * 100 if total else 0
+    filled = int(pct // 10)
+    bar = f"[{'█'*filled}{'░'*(10-filled)}] {pct:.1f}%"
     try:
-        await status.edit(
-            f"**{tag}**\n"
-            f"{bar(current, total)}\n"
-            f"`{current/1024/1024:.2f} / {total/1024/1024:.2f} MB`\n"
-            f"🚀 `{speed/1024/1024:.2f} MB/s` | ⏳ `{int(eta)}s`"
-        )
+        await message.edit(f"**Uploading**\n{bar}")
     except:
         pass
 
@@ -64,11 +44,10 @@ app = Client(
 # ================= HELPERS =================
 
 def extract_clean_url(text):
-    m = re.search(r'(https?://[^\s]+)', text)
+    m = re.search(r"(https?://[^\s]+)", text)
     return m.group(1) if m else None
 
-# ================= GOFILE =================
-
+# ---------- GOFILE ----------
 async def download_gofile(content_id, status):
     headers = {
         "Authorization": f"Bearer {GOFILE_API_TOKEN}",
@@ -78,30 +57,37 @@ async def download_gofile(content_id, status):
     r = requests.get(
         f"https://api.gofile.io/getContent?contentId={content_id}",
         headers=headers
-    ).json()
+    )
+    files = r.json()["data"]["children"]
 
-    for item in r["data"]["children"].values():
+    for item in files.values():
         if item["type"] != "file":
             continue
 
         out = os.path.join(DOWNLOAD_DIR, item["name"])
-        with requests.get(item["directLink"], stream=True) as s:
-            total = int(s.headers.get("content-length", 0))
+        with requests.get(item["directLink"], stream=True) as dl:
+            total = int(dl.headers.get("content-length", 0))
             cur = 0
             with open(out, "wb") as f:
-                for chunk in s.iter_content(1024 * 1024):
+                for chunk in dl.iter_content(1024 * 1024):
                     f.write(chunk)
                     cur += len(chunk)
-                    await progress_func(cur, total, status, "Downloading")
+                    pct = (cur / total) * 100 if total else 0
+                    filled = int(pct // 10)
+                    bar = f"[{'█'*filled}{'░'*(10-filled)}] {pct:.1f}%"
+                    try:
+                        await status.edit(f"**Downloading**\n{bar}")
+                    except:
+                        pass
 
-# ================= YT-DLP =================
-
-def download_ytdlp(url, out, status):
+# ---------- YT-DLP WITH PROGRESS ----------
+async def download_ytdlp(url, out, status):
     parsed = urlparse(url)
 
     cmd = [
         "yt-dlp",
         "--newline",
+        "--progress",
         "--no-playlist",
         "--cookies", COOKIES_FILE,
         "--user-agent", UA,
@@ -111,21 +97,31 @@ def download_ytdlp(url, out, status):
         url
     ]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
 
+    last = 0
     for line in proc.stdout:
         if "%" in line:
             try:
                 pct = float(line.split("%")[0].split()[-1])
-                cur = pct
-                await status.edit(f"**Downloading**\n[{int(pct)//10*'█'}{'░'*(10-int(pct)//10)}] {pct:.1f}%")
+                if time.time() - last < 2:
+                    continue
+                last = time.time()
+                filled = int(pct // 10)
+                bar = f"[{'█'*filled}{'░'*(10-filled)}] {pct:.1f}%"
+                await status.edit(f"**Downloading**\n{bar}")
             except:
                 pass
 
     proc.wait()
 
-# ================= VIDEO FIX + THUMB =================
-
+# ---------- FASTSTART + THUMB (40s) ----------
 def faststart_and_thumb(src):
     base = src.rsplit(".", 1)[0]
     fixed = f"{base}_fixed.mp4"
@@ -136,7 +132,6 @@ def faststart_and_thumb(src):
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
-    # ✅ THUMB AT 40 SECONDS
     subprocess.run(
         ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:40", "-vframes", "1", thumb],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -145,8 +140,7 @@ def faststart_and_thumb(src):
     os.remove(src)
     return fixed, thumb if os.path.exists(thumb) else None
 
-# ================= SPLIT =================
-
+# ---------- SPLIT ----------
 def split_file(path):
     parts = []
     size = os.path.getsize(path)
@@ -173,7 +167,8 @@ async def handler(client, m: Message):
     status = await m.reply("⏬ Starting download...")
 
     if GOFILE_RE.search(url):
-        await download_gofile(GOFILE_RE.search(url).group(1), status)
+        cid = GOFILE_RE.search(url).group(1)
+        await download_gofile(cid, status)
     else:
         await download_ytdlp(url, os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"), status)
 
@@ -192,12 +187,12 @@ async def handler(client, m: Message):
 
         for part in parts:
             await client.send_video(
-                m.chat.id,
-                part,
+                chat_id=m.chat.id,
+                video=part,
                 thumb=thumb,
                 supports_streaming=True,
-                progress=progress_func,
-                progress_args=(status, "Uploading")
+                progress=upload_progress,
+                progress_args=(status,)
             )
             os.remove(part)
 
