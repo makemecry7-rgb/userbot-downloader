@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import asyncio
 import base64
+import requests
 from urllib.parse import urlparse
 
 from pyrogram import Client, filters
@@ -19,6 +20,8 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 DOWNLOAD_DIR = "downloads"
 COOKIES_FILE = "cookies.txt"
 SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
+
+GOFILE_API_TOKEN = os.getenv("GOFILE_API_TOKEN")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -116,6 +119,38 @@ def generate_thumb(video):
 
     return thumb
 
+# ================= GOFILE (ADDED) =================
+
+def is_gofile(url):
+    return "gofile.io/d/" in url
+
+def get_gofile_files(content_id):
+    if not GOFILE_API_TOKEN:
+        raise Exception("GOFILE_API_TOKEN not set")
+
+    r = requests.get(
+        "https://api.gofile.io/getContent",
+        headers={
+            "Authorization": f"Bearer {GOFILE_API_TOKEN}",
+            "User-Agent": "Mozilla/5.0"
+        },
+        params={"contentId": content_id},
+        timeout=30
+    ).json()
+
+    if r.get("status") != "ok":
+        raise Exception("GoFile API failed")
+
+    files = []
+    for item in r["data"]["contents"].values():
+        if item["type"] == "file":
+            files.append((item["name"], item["directLink"]))
+
+    if not files:
+        raise Exception("No files found in GoFile folder")
+
+    return files
+
 # ================= YT-DLP WITH PROGRESS =================
 
 async def ytdlp_download(url, status_msg):
@@ -173,7 +208,18 @@ async def handler(_, m: Message):
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        await ytdlp_download(url, status)
+        # ---------- GOFILE ----------
+        if is_gofile(url):
+            content_id = url.rstrip("/").split("/")[-1]
+            files = get_gofile_files(content_id)
+
+            for name, link in files:
+                out = os.path.join(DOWNLOAD_DIR, name)
+                subprocess.run(["curl", "-L", link, "-o", out], check=True)
+
+        # ---------- EVERYTHING ELSE ----------
+        else:
+            await ytdlp_download(url, status)
 
         files = collect_files()
         if not files:
