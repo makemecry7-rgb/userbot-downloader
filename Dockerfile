@@ -25,7 +25,7 @@ RUN wget -qO - https://mega.nz/linux/repo/Debian_11/Release.key | gpg --dearmor 
 
 # ================= JDOWLOADER (HEADLESS) =================
 RUN mkdir -p /opt/jdownloader && \
-    wget -O /opt/jdownloader/JDownloader.jar \
+    wget -O /opt/jdownloader/JDownloader.jar \ -norestart
     https://installer.jdownloader.org/JDownloader.jar && \
     echo '#!/bin/sh\njava -jar /opt/jdownloader/JDownloader.jar "$@"' \
     > /usr/local/bin/jdownloader && \
