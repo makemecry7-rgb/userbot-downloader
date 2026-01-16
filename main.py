@@ -20,6 +20,7 @@ ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
+MEGA_RE = re.compile(r"https?://mega\.nz/")
 
 # ================= CLIENT =================
 
@@ -69,15 +70,43 @@ async def download_gofile(cid, status):
                     pct = cur * 100 / total if total else 0
                     bar = f"[{'█'*int(pct//10)}{'░'*(10-int(pct//10))}] {pct:.1f}%"
                     try:
-                        await status.edit(f"⬇️ Downloading\n{bar}")
+                        await status.edit(f"⬇️ Downloading (GoFile)\n{bar}")
                     except:
                         pass
+
+# ================= MEGA =================
+
+async def download_mega(url, status):
+    cmd = [
+        "megadl",
+        "--recursive",
+        "--path", DOWNLOAD_DIR,
+        url
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+
+    last = 0
+    for line in proc.stdout:
+        if "%" in line and time.time() - last > 2:
+            last = time.time()
+            try:
+                pct = float(line.split("%")[0].split()[-1])
+                bar = f"[{'█'*int(pct//10)}{'░'*(10-int(pct//10))}] {pct:.1f}%"
+                await status.edit(f"⬇️ Downloading (MEGA)\n{bar}")
+            except:
+                pass
+
+    proc.wait()
 
 # ================= YTDLP + ARIA2 =================
 
 async def download_with_aria2(url, status):
-    parsed = urlparse(url)
-
     out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
 
     cmd = [
@@ -163,6 +192,10 @@ async def handler(_, m: Message):
 
     if GOFILE_RE.search(url):
         await download_gofile(GOFILE_RE.search(url).group(1), status)
+
+    elif MEGA_RE.search(url):
+        await download_mega(url, status)
+
     else:
         await download_with_aria2(url, status)
 
