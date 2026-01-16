@@ -1,6 +1,12 @@
-import os, re, subprocess, time, threading
+import os
+import re
+import asyncio
+import shutil
+import subprocess
+import threading
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ================= CONFIG =================
 
@@ -8,30 +14,51 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
-LOG_CHANNEL = -1003609000029  # YOUR CHANNEL
+# YOUR CHANNEL ID (logs / trash)
+LOG_CHANNEL = -1003609000029  # <-- change if needed
 
-TMP_DIR = "/tmp"
+DOWNLOAD_DIR = "/tmp/downloads"
 UA = "Mozilla/5.0"
 
-ALLOWED_VIDEO = (".mp4", ".mkv", ".webm", ".mov", ".avi")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ================= CLIENT =================
+PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
+
+# ================= WEB SERVER (KOYEB NEEDS THIS) =================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def start_web():
+    server = HTTPServer(("0.0.0.0", 8000), HealthHandler)
+    server.serve_forever()
+
+threading.Thread(target=start_web, daemon=True).start()
+
+# ================= PYROGRAM =================
 
 app = Client(
     "userbot",
     api_id=API_ID,
     api_hash=API_HASH,
-    session_string=SESSION_STRING
+    session_string=SESSION_STRING,
+    in_memory=True
 )
 
-# ================= KEEP RAILWAY ALIVE =================
+# ================= PROGRESS =================
 
-def heartbeat():
-    while True:
-        print("alive")
-        time.sleep(60)
-
-threading.Thread(target=heartbeat, daemon=True).start()
+async def progress(current, total, msg, text):
+    if not total:
+        return
+    percent = current * 100 / total
+    bar = f"[{'█'*int(percent//10)}{'░'*(10-int(percent//10))}] {percent:.1f}%"
+    try:
+        await msg.edit(f"{text}\n{bar}")
+    except:
+        pass
 
 # ================= HELPERS =================
 
@@ -39,35 +66,15 @@ def extract_url(text):
     m = re.search(r"(https?://[^\s]+)", text)
     return m.group(1) if m else None
 
-async def log(text):
-    try:
-        await app.send_message(LOG_CHANNEL, text)
-    except:
-        pass
-
-async def upload_progress(current, total, msg):
-    if total == 0:
-        return
-    pct = current * 100 / total
-    bar = f"[{'█'*int(pct//10)}{'░'*(10-int(pct//10))}] {pct:.1f}%"
-    try:
-        await msg.edit(f"⬆️ Uploading\n{bar}")
-    except:
-        pass
-
 # ================= DOWNLOAD =================
 
-async def download_video(url, status):
-    await log(f"⬇️ Download started\n{url}")
-
-    out = os.path.join(TMP_DIR, "video.%(ext)s")
+async def download(url, status):
+    out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
 
     cmd = [
         "yt-dlp",
-        "--newline",
         "--no-playlist",
         "--user-agent", UA,
-        "-f", "bv*+ba/b",
         "-o", out,
         url
     ]
@@ -79,10 +86,8 @@ async def download_video(url, status):
         text=True
     )
 
-    last = 0
     for line in proc.stdout:
-        if "%" in line and time.time() - last > 2:
-            last = time.time()
+        if "%" in line:
             try:
                 pct = float(line.split("%")[0].split()[-1])
                 bar = f"[{'█'*int(pct//10)}{'░'*(10-int(pct//10))}] {pct:.1f}%"
@@ -92,31 +97,6 @@ async def download_video(url, status):
 
     proc.wait()
 
-    for f in os.listdir(TMP_DIR):
-        if f.lower().endswith(ALLOWED_VIDEO):
-            return os.path.join(TMP_DIR, f)
-
-    return None
-
-# ================= FIX STREAMING + THUMB =================
-
-def fix_video(src):
-    fixed = src.replace(".", "_fixed.", 1)
-    thumb = src.replace(".", ".jpg", 1)
-
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:05", "-vframes", "1", thumb],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-
-    os.remove(src)
-    return fixed, thumb if os.path.exists(thumb) else None
-
 # ================= HANDLER =================
 
 @app.on_message(filters.private & filters.text)
@@ -125,43 +105,37 @@ async def handler(_, m: Message):
     if not url:
         return
 
-    status = await m.reply("⏬ Starting...")
+    status = await m.reply("⏬ Starting download...")
 
     try:
-        video = await download_video(url, status)
-        if not video:
-            await status.edit("❌ Download failed")
-            await log(f"❌ Failed download\n{url}")
-            return
+        await download(url, status)
 
-        await status.edit("🎞 Processing...")
-        fixed, thumb = fix_video(video)
+        await status.edit("📤 Uploading...")
 
-        await app.send_video(
-            "me",  # SAVED MESSAGES
-            fixed,
-            supports_streaming=True,
-            thumb=thumb,
-            progress=upload_progress,
-            progress_args=(status,)
-        )
+        for f in os.listdir(DOWNLOAD_DIR):
+            path = os.path.join(DOWNLOAD_DIR, f)
 
-        await status.edit("✅ Sent to Saved Messages")
-        await log(f"✅ Uploaded successfully\n{url}")
+            await app.send_video(
+                "me",  # Saved Messages
+                path,
+                supports_streaming=True,
+                progress=progress,
+                progress_args=(status, "⬆️ Uploading")
+            )
+
+            # Log copy
+            await app.send_document(LOG_CHANNEL, path)
+
+            os.remove(path)
 
     except Exception as e:
-        await status.edit("❌ Error occurred")
-        await log(f"🔥 ERROR\n{e}")
+        await app.send_message(LOG_CHANNEL, f"❌ ERROR:\n{e}")
 
-    finally:
-        # CLEAN TMP ALWAYS
-        for f in os.listdir(TMP_DIR):
-            try:
-                os.remove(os.path.join(TMP_DIR, f))
-            except:
-                pass
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+    await status.edit("✅ Done")
 
 # ================= START =================
 
-print("Userbot running")
 app.run()
