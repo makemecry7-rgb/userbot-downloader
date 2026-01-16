@@ -1,11 +1,4 @@
-import os
-import re
-import shutil
-import subprocess
-import requests
-import time
-from urllib.parse import urlparse
-
+import os, re, subprocess, time, threading
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -14,19 +7,13 @@ from pyrogram.types import Message
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
-GOFILE_API_TOKEN = os.getenv("GOFILE_API_TOKEN")
 
-TARGET_CHANNEL = -1003609000029  # YOUR CHANNEL
+LOG_CHANNEL = -1003609000029  # YOUR CHANNEL
 
-DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
+TMP_DIR = "/tmp"
 UA = "Mozilla/5.0"
 
-ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
+ALLOWED_VIDEO = (".mp4", ".mkv", ".webm", ".mov", ".avi")
 
 # ================= CLIENT =================
 
@@ -37,7 +24,26 @@ app = Client(
     session_string=SESSION_STRING
 )
 
-# ================= PROGRESS =================
+# ================= KEEP RAILWAY ALIVE =================
+
+def heartbeat():
+    while True:
+        print("alive")
+        time.sleep(60)
+
+threading.Thread(target=heartbeat, daemon=True).start()
+
+# ================= HELPERS =================
+
+def extract_url(text):
+    m = re.search(r"(https?://[^\s]+)", text)
+    return m.group(1) if m else None
+
+async def log(text):
+    try:
+        await app.send_message(LOG_CHANNEL, text)
+    except:
+        pass
 
 async def upload_progress(current, total, msg):
     if total == 0:
@@ -49,49 +55,19 @@ async def upload_progress(current, total, msg):
     except:
         pass
 
-# ================= HELPERS =================
+# ================= DOWNLOAD =================
 
-def extract_url(text):
-    m = re.search(r"(https?://[^\s]+)", text)
-    return m.group(1) if m else None
+async def download_video(url, status):
+    await log(f"⬇️ Download started\n{url}")
 
-# ================= GOFILE =================
-
-async def download_gofile(cid, status):
-    r = requests.get(
-        f"https://api.gofile.io/getContent?contentId={cid}",
-        headers={"Authorization": f"Bearer {GOFILE_API_TOKEN}"}
-    ).json()
-
-    for f in r["data"]["children"].values():
-        if f["type"] != "file":
-            continue
-
-        out = os.path.join(DOWNLOAD_DIR, f["name"])
-        with requests.get(f["directLink"], stream=True) as d:
-            total = int(d.headers.get("content-length", 0))
-            cur = 0
-            with open(out, "wb") as o:
-                for chunk in d.iter_content(1024 * 1024):
-                    o.write(chunk)
-                    cur += len(chunk)
-                    if total:
-                        pct = cur * 100 / total
-                        bar = f"[{'█'*int(pct//10)}{'░'*(10-int(pct//10))}] {pct:.1f}%"
-                        try:
-                            await status.edit(f"⬇️ Downloading (GoFile)\n{bar}")
-                        except:
-                            pass
-
-# ================= GENERIC / DIRECT / YTDLP =================
-
-async def download_generic(url, status):
-    out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+    out = os.path.join(TMP_DIR, "video.%(ext)s")
 
     cmd = [
         "yt-dlp",
         "--newline",
         "--no-playlist",
+        "--user-agent", UA,
+        "-f", "bv*+ba/b",
         "-o", out,
         url
     ]
@@ -105,7 +81,7 @@ async def download_generic(url, status):
 
     last = 0
     for line in proc.stdout:
-        if "%" in line and time.time() - last > 1:
+        if "%" in line and time.time() - last > 2:
             last = time.time()
             try:
                 pct = float(line.split("%")[0].split()[-1])
@@ -116,23 +92,30 @@ async def download_generic(url, status):
 
     proc.wait()
 
-# ================= SPLIT =================
+    for f in os.listdir(TMP_DIR):
+        if f.lower().endswith(ALLOWED_VIDEO):
+            return os.path.join(TMP_DIR, f)
 
-def split_file(path):
-    parts = []
-    with open(path, "rb") as f:
-        i = 1
-        while True:
-            chunk = f.read(SPLIT_SIZE)
-            if not chunk:
-                break
-            part = f"{path}.part{i}.mp4"
-            with open(part, "wb") as o:
-                o.write(chunk)
-            parts.append(part)
-            i += 1
-    os.remove(path)
-    return parts
+    return None
+
+# ================= FIX STREAMING + THUMB =================
+
+def fix_video(src):
+    fixed = src.replace(".", "_fixed.", 1)
+    thumb = src.replace(".", ".jpg", 1)
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:05", "-vframes", "1", thumb],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    os.remove(src)
+    return fixed, thumb if os.path.exists(thumb) else None
 
 # ================= HANDLER =================
 
@@ -142,41 +125,43 @@ async def handler(_, m: Message):
     if not url:
         return
 
-    status = await m.reply("⏬ Starting download...")
+    status = await m.reply("⏬ Starting...")
 
     try:
-        if GOFILE_RE.search(url):
-            await download_gofile(GOFILE_RE.search(url).group(1), status)
-        else:
-            await download_generic(url, status)
+        video = await download_video(url, status)
+        if not video:
+            await status.edit("❌ Download failed")
+            await log(f"❌ Failed download\n{url}")
+            return
 
-        await status.edit("⬆️ Uploading to channel...")
+        await status.edit("🎞 Processing...")
+        fixed, thumb = fix_video(video)
 
-        for f in os.listdir(DOWNLOAD_DIR):
-            path = os.path.join(DOWNLOAD_DIR, f)
-            if not path.lower().endswith(ALLOWED_EXT):
-                continue
+        await app.send_video(
+            "me",  # SAVED MESSAGES
+            fixed,
+            supports_streaming=True,
+            thumb=thumb,
+            progress=upload_progress,
+            progress_args=(status,)
+        )
 
-            files = [path]
-            if os.path.getsize(path) > SPLIT_SIZE:
-                files = split_file(path)
-
-            for part in files:
-                await app.send_video(
-                    TARGET_CHANNEL,
-                    part,
-                    supports_streaming=True,
-                    progress=upload_progress,
-                    progress_args=(status,)
-                )
-                os.remove(part)
+        await status.edit("✅ Sent to Saved Messages")
+        await log(f"✅ Uploaded successfully\n{url}")
 
     except Exception as e:
-        await status.edit(f"❌ Error:\n{e}")
+        await status.edit("❌ Error occurred")
+        await log(f"🔥 ERROR\n{e}")
 
-    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    finally:
+        # CLEAN TMP ALWAYS
+        for f in os.listdir(TMP_DIR):
+            try:
+                os.remove(os.path.join(TMP_DIR, f))
+            except:
+                pass
 
 # ================= START =================
 
+print("Userbot running")
 app.run()
