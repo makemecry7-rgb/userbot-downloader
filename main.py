@@ -1,5 +1,11 @@
-import os, re, shutil, subprocess, requests, time
+import os
+import re
+import shutil
+import subprocess
+import requests
+import time
 from urllib.parse import urlparse
+
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -10,12 +16,11 @@ API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 GOFILE_API_TOKEN = os.getenv("GOFILE_API_TOKEN")
 
-CHANNEL_ID = -1003609000029  # ✅ YOUR CHANNEL (important: -100)
+TARGET_CHANNEL = -1003609000029  # YOUR CHANNEL
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024
-COOKIES_FILE = "cookies.txt"
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
+UA = "Mozilla/5.0"
 
 ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
 
@@ -31,13 +36,6 @@ app = Client(
     api_hash=API_HASH,
     session_string=SESSION_STRING
 )
-
-# ================= CLEANUP =================
-
-def cleanup():
-    if os.path.exists(DOWNLOAD_DIR):
-        shutil.rmtree(DOWNLOAD_DIR)
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ================= PROGRESS =================
 
@@ -71,46 +69,52 @@ async def download_gofile(cid, status):
 
         out = os.path.join(DOWNLOAD_DIR, f["name"])
         with requests.get(f["directLink"], stream=True) as d:
+            total = int(d.headers.get("content-length", 0))
+            cur = 0
             with open(out, "wb") as o:
-                for c in d.iter_content(1024 * 1024):
-                    o.write(c)
+                for chunk in d.iter_content(1024 * 1024):
+                    o.write(chunk)
+                    cur += len(chunk)
+                    if total:
+                        pct = cur * 100 / total
+                        bar = f"[{'█'*int(pct//10)}{'░'*(10-int(pct//10))}] {pct:.1f}%"
+                        try:
+                            await status.edit(f"⬇️ Downloading (GoFile)\n{bar}")
+                        except:
+                            pass
 
-# ================= YT-DLP =================
+# ================= GENERIC / DIRECT / YTDLP =================
 
-async def download_ytdlp(url, status):
+async def download_generic(url, status):
     out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
 
     cmd = [
         "yt-dlp",
+        "--newline",
         "--no-playlist",
-        "--cookies", COOKIES_FILE,
-        "--user-agent", UA,
-        "--merge-output-format", "mp4",
         "-o", out,
         url
     ]
 
-    subprocess.run(cmd, check=True)
-
-# ================= VIDEO FIX =================
-
-def fix_video(src):
-    base = src.rsplit(".", 1)[0]
-    fixed = f"{base}_fixed.mp4"
-    thumb = f"{base}.jpg"
-
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
     )
 
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:05", "-vframes", "1", thumb],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    last = 0
+    for line in proc.stdout:
+        if "%" in line and time.time() - last > 1:
+            last = time.time()
+            try:
+                pct = float(line.split("%")[0].split()[-1])
+                bar = f"[{'█'*int(pct//10)}{'░'*(10-int(pct//10))}] {pct:.1f}%"
+                await status.edit(f"⬇️ Downloading\n{bar}")
+            except:
+                pass
 
-    os.remove(src)
-    return fixed, thumb if os.path.exists(thumb) else None
+    proc.wait()
 
 # ================= SPLIT =================
 
@@ -122,10 +126,10 @@ def split_file(path):
             chunk = f.read(SPLIT_SIZE)
             if not chunk:
                 break
-            p = f"{path}.part{i}.mp4"
-            with open(p, "wb") as o:
+            part = f"{path}.part{i}.mp4"
+            with open(part, "wb") as o:
                 o.write(chunk)
-            parts.append(p)
+            parts.append(part)
             i += 1
     os.remove(path)
     return parts
@@ -138,49 +142,40 @@ async def handler(_, m: Message):
     if not url:
         return
 
-    status = await m.reply("⏬ Downloading...")
-
-    cleanup()
+    status = await m.reply("⏬ Starting download...")
 
     try:
         if GOFILE_RE.search(url):
             await download_gofile(GOFILE_RE.search(url).group(1), status)
         else:
-            await download_ytdlp(url, status)
+            await download_generic(url, status)
+
+        await status.edit("⬆️ Uploading to channel...")
+
+        for f in os.listdir(DOWNLOAD_DIR):
+            path = os.path.join(DOWNLOAD_DIR, f)
+            if not path.lower().endswith(ALLOWED_EXT):
+                continue
+
+            files = [path]
+            if os.path.getsize(path) > SPLIT_SIZE:
+                files = split_file(path)
+
+            for part in files:
+                await app.send_video(
+                    TARGET_CHANNEL,
+                    part,
+                    supports_streaming=True,
+                    progress=upload_progress,
+                    progress_args=(status,)
+                )
+                os.remove(part)
+
     except Exception as e:
-        await status.edit(f"❌ Download failed\n{e}")
-        cleanup()
-        return
+        await status.edit(f"❌ Error:\n{e}")
 
-    await status.edit("🎞 Processing...")
-
-    for f in os.listdir(DOWNLOAD_DIR):
-        p = os.path.join(DOWNLOAD_DIR, f)
-        if not p.lower().endswith(ALLOWED_EXT):
-            continue
-
-        fixed, thumb = fix_video(p)
-        files = [fixed]
-
-        if os.path.getsize(fixed) > SPLIT_SIZE:
-            files = split_file(fixed)
-
-        for part in files:
-            await app.send_video(
-                CHANNEL_ID,
-                part,
-                thumb=thumb,
-                supports_streaming=True,
-                progress=upload_progress,
-                progress_args=(status,)
-            )
-            os.remove(part)
-
-        if thumb and os.path.exists(thumb):
-            os.remove(thumb)
-
-    await status.edit("✅ Uploaded to channel")
-    cleanup()
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ================= START =================
 
